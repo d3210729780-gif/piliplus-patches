@@ -1,0 +1,317 @@
+diff --git a/lib/models/danmaku_content_item.dart b/lib/models/danmaku_content_item.dart
+index bf7d51c..ad2f6c2 100644
+--- a/lib/models/danmaku_content_item.dart
++++ b/lib/models/danmaku_content_item.dart
+@@ -5,6 +5,27 @@ import 'package:material_ui/material_ui.dart';
+ 
+ enum DanmakuItemType { scroll, top, bottom, special }
+ 
++/// 弹幕里的表情图片（直播表情/大表情）
++///
++/// [text] 是它在弹幕文本里的占位串（如 `[2233娘]`），图片还没加载好时用它兜底显示。
++class DanmakuEmote {
++  final String url;
++  final double width;
++  final double height;
++  final String text;
++
++  const DanmakuEmote({
++    required this.url,
++    this.width = 0,
++    this.height = 0,
++    this.text = '',
++  });
++
++  @override
++  String toString() => 'DanmakuEmote(text="$text", url=$url, '
++      '${width}x$height)';
++}
++
+ class DanmakuContentItem<T> {
+   /// 弹幕文本
+   final String text;
+@@ -26,6 +47,9 @@ class DanmakuContentItem<T> {
+ 
+   final T? extra;
+ 
++  /// 文本里内嵌的表情：key 为 [text] 中出现的占位串
++  final Map<String, DanmakuEmote>? emotes;
++
+   DanmakuContentItem(
+     this.text, {
+     this.color = Colors.white,
+@@ -34,6 +58,7 @@ class DanmakuContentItem<T> {
+     this.isColorful = false,
+     this.count,
+     this.extra,
++    this.emotes,
+   });
+ 
+   @override
+diff --git a/lib/utils/utils.dart b/lib/utils/utils.dart
+index aa0f4f6..32d43cf 100644
+--- a/lib/utils/utils.dart
++++ b/lib/utils/utils.dart
+@@ -1,4 +1,6 @@
++import 'dart:io' show HttpClient;
+ import 'dart:math';
++import 'dart:typed_data' show BytesBuilder;
+ import 'dart:ui' as ui;
+ 
+ import 'package:canvas_danmaku/models/danmaku_content_item.dart';
+@@ -7,17 +9,215 @@ import 'package:material_ui/material_ui.dart';
+ abstract final class DmUtils {
+   static const maxRasterizeSize = 8192.0;
+ 
++  /// 表情图片缓存上限（直播弹幕的表情种类有限，够用）
++  static const int maxEmoteCacheSize = 240;
++  static final Map<String, ui.Image> _emoteCache = {};
++
+   static double devicePixelRatio = 1;
+   static final Paint _selfSendPaint = Paint()
+     ..style = PaintingStyle.stroke
+     ..color = Colors.green;
+ 
++  /// 绘制表情图片用
++  static final Paint _paint = Paint();
++
+   static void updateSelfSendPaint(double strokeWidth) {
+     _selfSendPaint.strokeWidth = strokeWidth;
+   }
+ 
+   static String? fontFamily;
+ 
++  // ---------------------------------------------------------------------------
++  // 表情弹幕支持
++  // ---------------------------------------------------------------------------
++
++  /// 已缓存的表情图片
++  static ui.Image? emoteImage(String url) => _emoteCache[url];
++
++  /// 预加载表情图片。直播/弹幕都是先拿 URL 再画，必须提前解码，
++  /// 否则栅格化时拿不到图只能退化画文字。
++  static Future<void> preloadEmotes(
++    Iterable<DanmakuEmote> emotes, {
++    Map<String, String>? headers,
++  }) async {
++    final pending = <String>{};
++    for (final emote in emotes) {
++      if (emote.url.isEmpty || _emoteCache.containsKey(emote.url)) continue;
++      pending.add(emote.url);
++    }
++    for (final url in pending) {
++      if (_emoteCache.containsKey(url)) continue;
++      final image = await _loadEmoteImage(url, headers);
++      if (image == null) continue;
++      if (_emoteCache.length >= maxEmoteCacheSize) {
++        final oldest = _emoteCache.keys.first;
++        _emoteCache.remove(oldest);
++      }
++      _emoteCache[url] = image;
++    }
++  }
++
++  static Future<ui.Image?> _loadEmoteImage(
++    String url,
++    Map<String, String>? headers,
++  ) async {
++    final client = HttpClient();
++    try {
++      final request = await client.getUrl(Uri.parse(url));
++      headers?.forEach((key, value) => request.headers.set(key, value));
++      final response = await request.close();
++      if (response.statusCode != 200) return null;
++      final builder = BytesBuilder(copy: false);
++      await for (final chunk in response) {
++        builder.add(chunk);
++      }
++      final bytes = builder.takeBytes();
++      if (bytes.isEmpty) return null;
++      final codec = await ui.instantiateImageCodec(bytes);
++      final frame = await codec.getNextFrame();
++      codec.dispose();
++      return frame.image;
++    } catch (_) {
++      return null;
++    } finally {
++      client.close();
++    }
++  }
++
++  /// 表情在弹幕里的显示尺寸：按字号归一，避免官方大表情糊满屏幕
++  static ui.Size emoteDisplaySize(DanmakuEmote emote, double fontSize) {
++    final rawWidth = emote.width > 0 ? emote.width : fontSize * 1.4;
++    final rawHeight = emote.height > 0 ? emote.height : fontSize * 1.4;
++    final height = rawHeight
++        .clamp(fontSize * 1.2, fontSize * 2.4)
++        .toDouble();
++    return ui.Size(rawWidth * (height / rawHeight), height);
++  }
++
++  /// 把弹幕文本切成「文字 / 表情」片段
++  static List<({String text, DanmakuEmote? emote})> emoteSegments(
++    DanmakuContentItem content,
++  ) {
++    final text = content.text;
++    final emotes = content.emotes;
++    if (emotes == null || emotes.isEmpty || text.isEmpty) {
++      return [(text: text, emote: null)];
++    }
++    final keys = emotes.keys
++        .where((key) => key.isNotEmpty && text.contains(key))
++        .toList()
++      ..sort((a, b) => b.length.compareTo(a.length));
++    if (keys.isEmpty) return [(text: text, emote: null)];
++
++    final segments = <({String text, DanmakuEmote? emote})>[];
++    var index = 0;
++    while (index < text.length) {
++      var matchStart = -1;
++      String? matchKey;
++      for (final key in keys) {
++        final position = text.indexOf(key, index);
++        if (position != -1 && (matchStart == -1 || position < matchStart)) {
++          matchStart = position;
++          matchKey = key;
++        }
++      }
++      if (matchKey == null) {
++        segments.add((text: text.substring(index), emote: null));
++        break;
++      }
++      if (matchStart > index) {
++        segments.add((text: text.substring(index, matchStart), emote: null));
++      }
++      segments.add((text: matchKey, emote: emotes[matchKey]));
++      index = matchStart + matchKey.length;
++    }
++    return segments;
++  }
++
++  static void _addContentSpans(
++    ui.ParagraphBuilder builder,
++    DanmakuContentItem content,
++    ui.TextStyle style,
++    double fontSize,
++  ) {
++    builder.pushStyle(style);
++    for (final segment in emoteSegments(content)) {
++      final emote = segment.emote;
++      if (emote == null) {
++        if (segment.text.isNotEmpty) builder.addText(segment.text);
++      } else {
++        final size = emoteDisplaySize(emote, fontSize);
++        builder.addPlaceholder(
++          size.width,
++          size.height,
++          ui.PlaceholderAlignment.middle,
++        );
++      }
++    }
++    builder.pop();
++  }
++
++  /// 把表情画进占位区域；图没加载好时退化画占位文字
++  static void _drawEmotes(
++    ui.Canvas canvas,
++    ui.Paragraph paragraph,
++    ui.Offset offset,
++    DanmakuContentItem content,
++  ) {
++    final emotes = content.emotes;
++    if (emotes == null || emotes.isEmpty) return;
++    final segments = emoteSegments(content)
++        .where((segment) => segment.emote != null)
++        .toList();
++    if (segments.isEmpty) return;
++    final boxes = paragraph.getBoxesForPlaceholders();
++    for (var i = 0; i < boxes.length && i < segments.length; i++) {
++      final emote = segments[i].emote!;
++      final box = boxes[i];
++      final dst = ui.Rect.fromLTRB(
++        offset.dx + box.left,
++        offset.dy + box.top,
++        offset.dx + box.right,
++        offset.dy + box.bottom,
++      );
++      final image = _emoteCache[emote.url];
++      if (image != null) {
++        canvas.drawImageRect(
++          image,
++          ui.Rect.fromLTWH(
++            0,
++            0,
++            image.width.toDouble(),
++            image.height.toDouble(),
++          ),
++          dst,
++          _paint,
++        );
++      } else {
++        _drawEmoteFallback(canvas, dst, segments[i].text);
++      }
++    }
++  }
++
++  static void _drawEmoteFallback(ui.Canvas canvas, ui.Rect rect, String text) {
++    if (text.isEmpty || rect.width <= 0 || rect.height <= 0) return;
++    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
++      textAlign: TextAlign.left,
++      textDirection: TextDirection.ltr,
++      fontFamily: fontFamily,
++      maxLines: 1,
++    ))
++      ..pushStyle(ui.TextStyle(
++        color: const ui.Color(0xFFFFFFFF),
++        fontSize: rect.height * 0.55,
++      ))
++      ..addText(text);
++    final paragraph = builder.build()
++      ..layout(ui.ParagraphConstraints(width: rect.width));
++    canvas.drawParagraph(paragraph, ui.Offset(rect.left, rect.top));
++    paragraph.dispose();
++  }
++
+   static ui.Paragraph generateParagraph({
+     required DanmakuContentItem content,
+     required double fontSize,
+@@ -41,9 +241,12 @@ abstract final class DmUtils {
+         ..pop();
+     }
+ 
+-    builder
+-      ..pushStyle(ui.TextStyle(color: content.color, fontSize: fontSize))
+-      ..addText(content.text);
++    _addContentSpans(
++      builder,
++      content,
++      ui.TextStyle(color: content.color, fontSize: fontSize),
++      fontSize,
++    );
+ 
+     return builder.build()
+       ..layout(const ui.ParagraphConstraints(width: double.infinity));
+@@ -101,9 +304,12 @@ abstract final class DmUtils {
+           ..pop();
+       }
+ 
+-      builder
+-        ..pushStyle(ui.TextStyle(fontSize: fontSize, foreground: strokePaint))
+-        ..addText(content.text);
++      _addContentSpans(
++        builder,
++        content,
++        ui.TextStyle(fontSize: fontSize, foreground: strokePaint),
++        fontSize,
++      );
+ 
+       final strokeParagraph = builder.build()
+         ..layout(const ui.ParagraphConstraints(width: double.infinity));
+@@ -113,6 +319,7 @@ abstract final class DmUtils {
+     }
+ 
+     canvas.drawParagraph(contentParagraph, offset);
++    _drawEmotes(canvas, contentParagraph, offset, content);
+ 
+     if (content.selfSend) {
+       w += 4;

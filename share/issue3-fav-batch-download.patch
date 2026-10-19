@@ -1,0 +1,246 @@
+diff --git a/lib/pages/fav_detail/batch_download.dart b/lib/pages/fav_detail/batch_download.dart
+new file mode 100644
+index 0000000..3d4ca7d
+--- /dev/null
++++ b/lib/pages/fav_detail/batch_download.dart
+@@ -0,0 +1,132 @@
++import 'package:PiliPlus/common/widgets/dialog/simple_dialog_option.dart';
++import 'package:PiliPlus/http/loading_state.dart';
++import 'package:PiliPlus/http/video.dart';
++import 'package:PiliPlus/models/common/video/video_quality.dart';
++import 'package:PiliPlus/models_new/fav/fav_detail/media.dart';
++import 'package:PiliPlus/services/download/download_service.dart';
++import 'package:PiliPlus/utils/storage_pref.dart';
++import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
++import 'package:get/get.dart';
++import 'package:material_ui/material_ui.dart';
++
++/// 收藏夹多选批量下载：把选中的视频（含分P）一起丢进离线缓存队列。
++///
++/// 之前只能一个一个点进视频详情页再从菜单里下载，收藏夹里几十个视频非常麻烦。
++Future<void> batchDownloadFavVideos(
++  BuildContext context,
++  Iterable<FavDetailItemModel> items,
++) async {
++  // 只有 type == 2 是普通视频；音频/番剧等条目这里先跳过
++  final videos = items
++      .where((e) => e.type == 2 && (e.bvid?.isNotEmpty ?? false))
++      .toList();
++  final skipped = items.length - videos.length;
++  if (videos.isEmpty) {
++    SmartDialog.showToast('选中的条目里没有可下载的视频');
++    return;
++  }
++
++  final quality = await _pickQuality(context, videos.length);
++  if (quality == null) return;
++
++  final downloadService = Get.find<DownloadService>();
++  final before =
++      downloadService.downloadList.length + downloadService.waitDownloadQueue.length;
++
++  var submittedVideos = 0;
++  var submittedPages = 0;
++  var failed = 0;
++
++  SmartDialog.showLoading(msg: '正在解析 0/${videos.length}');
++  for (var i = 0; i < videos.length; i++) {
++    SmartDialog.showLoading(msg: '正在解析 ${i + 1}/${videos.length}');
++    final item = videos[i];
++    try {
++      final res = await VideoHttp.videoIntro(bvid: item.bvid!);
++      if (res case Success(:final response)) {
++        final pages = response.pages;
++        if (pages == null || pages.isEmpty) {
++          failed++;
++          continue;
++        }
++        submittedVideos++;
++        for (var index = 0; index < pages.length; index++) {
++          downloadService.downloadVideo(
++            index: index,
++            page: pages[index],
++            videoDetail: response,
++            videoQuality: quality,
++          );
++          submittedPages++;
++        }
++      } else {
++        failed++;
++      }
++    } catch (_) {
++      failed++;
++    }
++  }
++  SmartDialog.dismiss();
++
++  // _createDownload 是异步落盘的，等它把队列写进去再统计实际新增
++  await Future.delayed(const Duration(milliseconds: 600));
++  final after =
++      downloadService.downloadList.length + downloadService.waitDownloadQueue.length;
++  final added = after - before;
++
++  final buffer = StringBuffer('已加入下载队列：$submittedVideos 个视频');
++  if (submittedPages > submittedVideos) {
++    buffer.write('（共 $submittedPages 个分P）');
++  }
++  if (added < submittedPages) {
++    buffer.write('，${submittedPages - added} 个已在列表中跳过');
++  }
++  if (failed > 0) {
++    buffer.write('，$failed 个解析失败');
++  }
++  if (skipped > 0) {
++    buffer.write('，跳过 $skipped 个非视频条目');
++  }
++  SmartDialog.showToast(buffer.toString());
++}
++
++Future<VideoQuality?> _pickQuality(BuildContext context, int count) {
++  return showDialog<VideoQuality>(
++    context: context,
++    builder: (context) => SimpleDialog(
++      clipBehavior: Clip.hardEdge,
++      contentPadding: const EdgeInsets.symmetric(vertical: 12),
++      children: [
++        Padding(
++          padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
++          child: Text(
++            '选择画质（共 $count 个视频，按分P逐个加入）',
++            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
++          ),
++        ),
++        for (final quality in VideoQuality.values)
++          DialogOption(
++            onPressed: () => Navigator.of(context).pop(quality),
++            child: Row(
++              children: [
++                Expanded(
++                  child: Text(
++                    quality.desc,
++                    style: const TextStyle(fontSize: 14),
++                  ),
++                ),
++                if (quality.code == Pref.defaultVideoQa)
++                  Text(
++                    '默认',
++                    style: TextStyle(
++                      fontSize: 12,
++                      color: ColorScheme.of(context).outline,
++                    ),
++                  ),
++              ],
++            ),
++          ),
++      ],
++    ),
++  );
++}
+diff --git a/lib/pages/fav_detail/view.dart b/lib/pages/fav_detail/view.dart
+index b74b039..e07d443 100644
+--- a/lib/pages/fav_detail/view.dart
++++ b/lib/pages/fav_detail/view.dart
+@@ -11,6 +11,7 @@ import 'package:PiliPlus/models/common/fav_order_type.dart';
+ import 'package:PiliPlus/models_new/fav/fav_detail/media.dart';
+ import 'package:PiliPlus/models_new/fav/fav_folder/list.dart';
+ import 'package:PiliPlus/pages/dynamics_repost/view.dart';
++import 'package:PiliPlus/pages/fav_detail/batch_download.dart';
+ import 'package:PiliPlus/pages/fav_detail/controller.dart';
+ import 'package:PiliPlus/pages/fav_detail/widget/fav_video_card.dart';
+ import 'package:PiliPlus/utils/bili_utils.dart';
+@@ -23,6 +24,9 @@ import 'package:get/get.dart';
+ import 'package:material_design_icons_flutter/material_design_icons_flutter.dart';
+ import 'package:material_ui/material_ui.dart';
+ 
++/// 多选栏溢出菜单的动作
++enum _SelectAction { copy, move, delete }
++
+ class FavDetailPage extends StatefulWidget {
+   const FavDetailPage({super.key});
+ 
+@@ -336,35 +340,60 @@ class _FavDetailPageState extends State<FavDetailPage> with GridMixin {
+       ),
+       TextButton(
+         style: btnStyle,
+-        onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
+-          context: context,
+-          isCopy: true,
+-          ctr: _favDetailController,
+-          mediaId: _favDetailController.mediaId,
+-          mid: _favDetailController.account.mid,
++        onPressed: () => batchDownloadFavVideos(
++          context,
++          _favDetailController.allChecked,
+         ),
+-        child: Text('复制', style: textStyle),
++        child: Text('下载', style: textStyle),
+       ),
+-      TextButton(
+-        style: btnStyle,
+-        onPressed: () => RequestUtils.onCopyOrMove<FavDetailItemModel>(
+-          context: context,
+-          isCopy: false,
+-          ctr: _favDetailController,
+-          mediaId: _favDetailController.mediaId,
+-          mid: _favDetailController.account.mid,
+-        ),
+-        child: Text('移动', style: textStyle),
+-      ),
+-      TextButton(
+-        style: btnStyle,
+-        onPressed: _favDetailController.onRemove,
+-        child: Text(
+-          '删除',
+-          style: TextStyle(color: theme.colorScheme.error),
++      // 复制/移动/删除收进溢出菜单，否则多选栏在窄屏上会把「已选 N」挤重叠
++      PopupMenuButton<_SelectAction>(
++        tooltip: '更多',
++        icon: Icon(
++          Icons.more_vert,
++          size: 22,
++          color: theme.colorScheme.onSurfaceVariant,
+         ),
++        onSelected: (value) {
++          if (value == _SelectAction.copy) {
++            RequestUtils.onCopyOrMove<FavDetailItemModel>(
++              context: context,
++              isCopy: true,
++              ctr: _favDetailController,
++              mediaId: _favDetailController.mediaId,
++              mid: _favDetailController.account.mid,
++            );
++          } else if (value == _SelectAction.move) {
++            RequestUtils.onCopyOrMove<FavDetailItemModel>(
++              context: context,
++              isCopy: false,
++              ctr: _favDetailController,
++              mediaId: _favDetailController.mediaId,
++              mid: _favDetailController.account.mid,
++            );
++          } else {
++            _favDetailController.onRemove();
++          }
++        },
++        itemBuilder: (context) => [
++          const PopupMenuItem(
++            value: _SelectAction.copy,
++            child: Text('复制到其它收藏夹'),
++          ),
++          const PopupMenuItem(
++            value: _SelectAction.move,
++            child: Text('移动到其它收藏夹'),
++          ),
++          PopupMenuItem(
++            value: _SelectAction.delete,
++            child: Text(
++              '删除',
++              style: TextStyle(color: theme.colorScheme.error),
++            ),
++          ),
++        ],
+       ),
+-      const SizedBox(width: 10),
++      const SizedBox(width: 4),
+     ];
+   }
+ 

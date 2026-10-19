@@ -1,0 +1,5123 @@
+diff --git a/lib/pages/live_room/controller.dart b/lib/pages/live_room/controller.dart
+index a4cf637..0e36da1 100644
+--- a/lib/pages/live_room/controller.dart
++++ b/lib/pages/live_room/controller.dart
+@@ -43,6 +43,7 @@ import 'package:PiliPlus/utils/theme_utils.dart';
+ import 'package:PiliPlus/utils/utils.dart';
+ import 'package:PiliPlus/utils/video_utils.dart';
+ import 'package:canvas_danmaku/canvas_danmaku.dart';
++import 'package:canvas_danmaku/utils/utils.dart' as canvas_dm;
+ import 'package:easy_debounce/easy_throttle.dart';
+ import 'package:flutter/foundation.dart' show kDebugMode, kReleaseMode;
+ import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
+@@ -118,6 +119,13 @@ class LiveRoomController extends GetxController {
+   bool autoScroll = true;
+   LiveMessageStream? _msgStream;
+ 
++  /// 诊断用：本次进入直播间后收到的弹幕条数（判断弹幕流是否还活着）
++  int _dmCount = 0;
++  int get dmCount => _dmCount;
++
++  /// 服务端回推回来的、自己发的弹幕内容（判断是否真的上屏）
++  final List<String> ownDanmakuEcho = [];
++
+   List<String> _keywordList = const [];
+   Set<int> _shieldUids = const {};
+ 
+@@ -550,6 +558,45 @@ class LiveRoomController extends GetxController {
+           ..init();
+   }
+ 
++  static const Map<String, String> _emoteHeaders = {
++    'Referer': 'https://live.bilibili.com/',
++    'User-Agent':
++        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
++        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
++  };
++
++  /// 把直播弹幕里的表情转成画布能渲染的表情图，并顺手预解码
++  Map<String, DanmakuEmote>? _buildDanmakuEmotes(
++    String text,
++    Map<String, BaseEmote>? emots,
++    BaseEmote? uemote,
++  ) {
++    final emotes = <String, DanmakuEmote>{};
++    if (emots != null) {
++      for (final entry in emots.entries) {
++        emotes[entry.key] = DanmakuEmote(
++          url: entry.value.url,
++          width: entry.value.width,
++          height: entry.value.height,
++          text: entry.key,
++        );
++      }
++    }
++    if (uemote != null && !emotes.containsKey(text)) {
++      // 大表情：整条弹幕就是这一张图
++      emotes[text] = DanmakuEmote(
++        url: uemote.url,
++        width: uemote.width,
++        height: uemote.height,
++        text: text,
++      );
++    }
++    if (emotes.isEmpty) return null;
++    // 画布是同步栅格化的，图没解出来只能退化画文字，所以这里先预加载
++    canvas_dm.DmUtils.preloadEmotes(emotes.values, headers: _emoteHeaders);
++    return emotes;
++  }
++
+   void addDm(dynamic msg, [DanmakuContentItem<DanmakuExtra>? item]) {
+     _trimDm();
+ 
+@@ -573,6 +620,8 @@ class LiveRoomController extends GetxController {
+       // logger.i(' 原始弹幕消息 ======> ${jsonEncode(obj)}');
+       switch (obj['cmd']) {
+         case 'DANMU_MSG':
++          // 诊断用：统计弹幕流是否还在推数据
++          _dmCount++;
+           final info = obj['info'];
+           final first = info[0];
+           final content = first[15];
+@@ -580,6 +629,13 @@ class LiveRoomController extends GetxController {
+           // final midHash = first[7];
+           final uid = user['uid'] as int;
+           final msg = info[1];
++          // 记录服务端回推的「自己发的弹幕」，用于判断是否真的上屏
++          if (isLogin && uid == mid) {
++            ownDanmakuEcho.add(msg is String ? msg : '$msg');
++            if (ownDanmakuEcho.length > 30) {
++              ownDanmakuEcho.removeAt(0);
++            }
++          }
+           if (isBlocked(msg, uid)) {
+             return;
+           }
+@@ -589,6 +645,9 @@ class LiveRoomController extends GetxController {
+           if (first[13] case Map<String, dynamic> map) {
+             uemote = BaseEmote.fromJson(map);
+           }
++          final emots = (extra['emots'] as Map<String, dynamic>?)?.map(
++            (k, v) => MapEntry(k, BaseEmote.fromJson(v)),
++          );
+           final checkInfo = info[9];
+           final liveExtra = LiveDanmaku(
+             id: extra['id_str'],
+@@ -609,9 +668,7 @@ class LiveRoomController extends GetxController {
+             DanmakuMsg(
+               name: name,
+               text: msg,
+-              emots: (extra['emots'] as Map<String, dynamic>?)?.map(
+-                (k, v) => MapEntry(k, BaseEmote.fromJson(v)),
+-              ),
++              emots: emots,
+               uemote: uemote,
+               extra: liveExtra,
+               reply: reply,
+@@ -628,6 +685,8 @@ class LiveRoomController extends GetxController {
+               // extra['send_from_me'] is invalid
+               selfSend: isLogin && uid == mid,
+               extra: liveExtra,
++              // 表情弹幕：画面上的弹幕也能显示表情图，而不只是文字
++              emotes: _buildDanmakuEmotes(msg, emots, uemote),
+             ),
+           );
+           break;
+diff --git a/pubspec.lock b/pubspec.lock
+index 5ed81a1..44cfd60 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -6,7 +6,7 @@ packages:
+     description:
+       name: _fe_analyzer_shared
+       sha256: "48e48f73a431eb269eec66d243a63a07ed90ef9417a74047a3b98d52338626ad"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "109.0.0"
+   analyzer:
+@@ -14,23 +14,23 @@ packages:
+     description:
+       name: analyzer
+       sha256: "6d377901d198536b648172974d9d4f277910502cad92193466869cac0ff34990"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "14.5.0"
+   android_file_picker:
+     dependency: transitive
+     description:
+       name: android_file_picker
+-      sha256: "0aac28063a1b19893f02a55dc8e2318799814881b7f920df2d12d0d043c8fbbb"
+-      url: "https://pub.dev"
++      sha256: e94229cc41c4bb5fb6a2254146340a8b650664c99b5c93b9001f66c3375d0060
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.1.0"
++    version: "2.1.1"
+   ansicolor:
+     dependency: transitive
+     description:
+       name: ansicolor
+       sha256: "50e982d500bc863e1d703448afdbf9e5a72eb48840a4f766fa361ffd6877055f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.3"
+   app_links:
+@@ -38,7 +38,7 @@ packages:
+     description:
+       name: app_links
+       sha256: "08ba88bf19d9edea33130cb71c8ced2cb982b4e00b82efef4a434d1357bc69c3"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.2.2"
+   app_links_linux:
+@@ -46,7 +46,7 @@ packages:
+     description:
+       name: app_links_linux
+       sha256: "9ccb5802085a1e57bb07b6256fd1d61a78c7ec104944d4965e62938b4fefd9cb"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.4"
+   app_links_platform_interface:
+@@ -54,7 +54,7 @@ packages:
+     description:
+       name: app_links_platform_interface
+       sha256: "7546f09a6e93f4a2df2fe2bd40a5c6c64310ac461b036d82b43033be7a59f809"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.4"
+   app_links_web:
+@@ -62,7 +62,7 @@ packages:
+     description:
+       name: app_links_web
+       sha256: "382d32c6f486f15b1d7f5d6a37a70a481a4fc08382eef419d373169921a3e765"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.5"
+   archive:
+@@ -70,7 +70,7 @@ packages:
+     description:
+       name: archive
+       sha256: "0d58d1fa1fddf6588251ccf2819f3fb3b6d0452c1b2813ac7413a05592bfbefe"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.5.2"
+   args:
+@@ -78,7 +78,7 @@ packages:
+     description:
+       name: args
+       sha256: d0481093c50b1da8910eb0bb301626d4d8eb7284aa739614d2b394ee09e3ea04
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.7.0"
+   asn1lib:
+@@ -86,7 +86,7 @@ packages:
+     description:
+       name: asn1lib
+       sha256: "9a8f69025044eb466b9b60ef3bc3ac99b4dc6c158ae9c56d25eeccf5bc56d024"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.6.5"
+   async:
+@@ -94,7 +94,7 @@ packages:
+     description:
+       name: async
+       sha256: e2eb0491ba5ddb6177742d2da23904574082139b07c1e33b8503b9f46f3e1a37
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.13.1"
+   audio_service:
+@@ -111,7 +111,7 @@ packages:
+     description:
+       name: audio_service_platform_interface
+       sha256: "6283782851f6c8b501b60904a32fc7199dc631172da0629d7301e66f672ab777"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.1.3"
+   audio_service_web:
+@@ -119,7 +119,7 @@ packages:
+     description:
+       name: audio_service_web
+       sha256: b8ea9243201ee53383157fbccf13d5d2a866b5dda922ec19d866d1d5d70424df
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.1.4"
+   audio_session:
+@@ -136,7 +136,7 @@ packages:
+     description:
+       name: battery_plus
+       sha256: "49f75523cd5461a44202d67c5e1c73b790f16a822475b6f116d50714cd64a0ab"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.1.2"
+   battery_plus_platform_interface:
+@@ -144,7 +144,7 @@ packages:
+     description:
+       name: battery_plus_platform_interface
+       sha256: e8342c0f32de4b1dfd0223114b6785e48e579bfc398da9471c9179b907fa4910
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.1"
+   boolean_selector:
+@@ -152,7 +152,7 @@ packages:
+     description:
+       name: boolean_selector
+       sha256: "8aab1771e1243a5063b8b0ff68042d67334e3feab9e95b9490f9a6ebf73b42ea"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.2"
+   brotli:
+@@ -160,7 +160,7 @@ packages:
+     description:
+       name: brotli
+       sha256: "7f891558ed779aab2bed874f0a36b8123f9ff3f19cf6efbee89e18ed294945ae"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.6.0"
+   build:
+@@ -168,7 +168,7 @@ packages:
+     description:
+       name: build
+       sha256: "50df3d1558953a0d936401c1687cc41dbc039f9132f538c7bcb2aac2a580ae7f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.0"
+   build_config:
+@@ -176,7 +176,7 @@ packages:
+     description:
+       name: build_config
+       sha256: "4703a785fbc3c266c5c7518589d0863f6a05078ee33f7ca5aa4b87a56f1cedd2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.0"
+   build_daemon:
+@@ -184,7 +184,7 @@ packages:
+     description:
+       name: build_daemon
+       sha256: "39ab65f7c60c19af64b9ef96e6a5d3ab48355f7dddfd98a9079d55a8cb6628fc"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.1.7"
+   build_runner:
+@@ -192,7 +192,7 @@ packages:
+     description:
+       name: build_runner
+       sha256: "96b9da39a3a8d4365aa1ca6f7655437d80f514ba13d4c21d8408cc8aacb94681"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.17.1"
+   built_collection:
+@@ -200,7 +200,7 @@ packages:
+     description:
+       name: built_collection
+       sha256: "44922ecebd8e3d0cef743dadd3b54df4e87e2a4c52a29465a1872aa9e192caa8"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.1.2"
+   built_value:
+@@ -208,7 +208,7 @@ packages:
+     description:
+       name: built_value
+       sha256: f87ea98192116f7093cb214551ce1929caae0681fdba282b3d8b4462adee7bb7
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "8.13.0"
+   cached_network_image_ce:
+@@ -232,11 +232,9 @@ packages:
+   canvas_danmaku:
+     dependency: "direct main"
+     description:
+-      path: "."
+-      ref: main
+-      resolved-ref: "275046d8647a6a26cba1d0dadb9e28688cb3dbf1"
+-      url: "https://github.com/bggRGjQaUbCoE/canvas_danmaku.git"
+-    source: git
++      path: "third_party/canvas_danmaku"
++      relative: true
++    source: path
+     version: "0.2.6"
+   catcher_2:
+     dependency: "direct main"
+@@ -252,7 +250,7 @@ packages:
+     description:
+       name: characters
+       sha256: faf38497bda5ead2a8c7615f4f7939df04333478bf32e4173fcb06d428b5716b
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.1"
+   chat_bottom_container:
+@@ -269,7 +267,7 @@ packages:
+     description:
+       name: checked_yaml
+       sha256: "959525d3162f249993882720d52b7e0c833978df229be20702b33d48d91de70f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.4"
+   cli_config:
+@@ -277,7 +275,7 @@ packages:
+     description:
+       name: cli_config
+       sha256: ac20a183a07002b700f0c25e61b7ee46b23c309d76ab7b7640a028f18e4d99ec
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.0"
+   cli_util:
+@@ -285,7 +283,7 @@ packages:
+     description:
+       name: cli_util
+       sha256: ff6785f7e9e3c38ac98b2fb035701789de90154024a75b6cb926445e83197d1c
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.4.2"
+   clock:
+@@ -293,7 +291,7 @@ packages:
+     description:
+       name: clock
+       sha256: e51d50bca3217c9a9fa2b41a30e4a38971133f5f9ec7a3d57bae095007f1d28e
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.3"
+   cnativeapi:
+@@ -301,7 +299,7 @@ packages:
+     description:
+       name: cnativeapi
+       sha256: "251fb93cd7ec205445fa512ee5ddeb0b82b3273d071cfc0784ddffbbdebbf5d3"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.2"
+   code_assets:
+@@ -309,7 +307,7 @@ packages:
+     description:
+       name: code_assets
+       sha256: "828110d598123b5ea96c00c9f3c72105bf79f8ee36c20a39b26209ade421ec57"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   collection:
+@@ -317,7 +315,7 @@ packages:
+     description:
+       name: collection
+       sha256: "2f5709ae4d3d59dd8f7cd309b4e023046b57d8a6c82130785d2b0e5868084e76"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.19.1"
+   connectivity_plus:
+@@ -325,7 +323,7 @@ packages:
+     description:
+       name: connectivity_plus
+       sha256: "762c99f890ca8bf87f7337236f99edd42793843bc6c3631da294a76653a54bd0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.3.1"
+   connectivity_plus_platform_interface:
+@@ -333,7 +331,7 @@ packages:
+     description:
+       name: connectivity_plus_platform_interface
+       sha256: "3c09627c536d22fd24691a905cdd8b14520de69da52c7a97499c8be5284a32ed"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   convert:
+@@ -341,7 +339,7 @@ packages:
+     description:
+       name: convert
+       sha256: b30acd5944035672bc15c6b7a8b47d773e41e2f17de064350988c5d02adb1c68
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.2"
+   cookie_jar:
+@@ -349,7 +347,7 @@ packages:
+     description:
+       name: cookie_jar
+       sha256: "963da02c1ef64cb5ac20de948c9e5940aa351f1e34a12b1d327c83d85b7e8fff"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.0.9"
+   cross_file:
+@@ -357,7 +355,7 @@ packages:
+     description:
+       name: cross_file
+       sha256: f141ea4f277af142a0356955707f6556f37b03947d39d55585981a06ca437bd6
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.3.5+5"
+   crypto:
+@@ -365,7 +363,7 @@ packages:
+     description:
+       name: crypto
+       sha256: c8ea0233063ba03258fbcf2ca4d6dadfefe14f02fab57702265467a19f27fadf
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.7"
+   csslib:
+@@ -373,31 +371,31 @@ packages:
+     description:
+       name: csslib
+       sha256: "09bad715f418841f976c77db72d5398dc1253c21fb9c0c7f0b0b985860b2d58e"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.2"
+   cupertino_ui:
+     dependency: "direct main"
+     description:
+       name: cupertino_ui
+-      sha256: ea0b8170b40a86262b2fc21ac0625303f52df209dbf6fccc2b98b27eff44f6ce
+-      url: "https://pub.dev"
++      sha256: "8e14acc2817ff469b925b0e275ab85ecc6c769621360dd0af1331c47f916e247"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.1.2"
++    version: "1.1.3"
+   dart_style:
+     dependency: transitive
+     description:
+       name: dart_style
+-      sha256: "82ade9fc4273f29ed673e33166944465225b4f7fc5d4aaef48605cc751c18fc1"
+-      url: "https://pub.dev"
++      sha256: a0e4f65339b31eb6a9e6a12e14b4682a48d46fbc54a82f4a702396fbdbac63a7
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "3.1.13"
++    version: "3.1.14"
+   dbus:
+     dependency: transitive
+     description:
+       name: dbus
+       sha256: a48d5da28e89bd02196e80d81ed8d7954923d00a0f4a68cc20b575038f023383
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.15"
+   device_info_plus:
+@@ -405,7 +403,7 @@ packages:
+     description:
+       name: device_info_plus
+       sha256: ade1c36f8355d6284c98e4a47992ea263887ed3d1acb281e37635dd45f04c4aa
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "13.3.0"
+   device_info_plus_platform_interface:
+@@ -413,7 +411,7 @@ packages:
+     description:
+       name: device_info_plus_platform_interface
+       sha256: "04b173a92e2d9161dfead145667037c8d834db725ce2e7b942bfe18fd2f45a46"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "8.1.0"
+   dio:
+@@ -421,7 +419,7 @@ packages:
+     description:
+       name: dio
+       sha256: "852ec3b48cc431ac04fff978413c541502b67ffc3e26921e74e3d994694192c1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.11.1"
+   dio_http2_adapter:
+@@ -429,7 +427,7 @@ packages:
+     description:
+       name: dio_http2_adapter
+       sha256: "92c9dd3c3a80bf50f8ac3cde5751a02b63b9149eb9084dd5c0aede286ad10269"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.9.0"
+   dio_web_adapter:
+@@ -437,7 +435,7 @@ packages:
+     description:
+       name: dio_web_adapter
+       sha256: "3a1b2cd7be71086f38504956e3ebcd2837288d231ff454bafa78021244102bfc"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.2"
+   dlna_dart:
+@@ -445,7 +443,7 @@ packages:
+     description:
+       name: dlna_dart
+       sha256: da607931548720331b7503f72c426fa7fbd19e9144a4778d293c16a5bc186407
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.1.1"
+   dynamic_color:
+@@ -453,7 +451,7 @@ packages:
+     description:
+       name: dynamic_color
+       sha256: "869b3bce0100eb519768ecd71c0111f0b5ea679f5f62e1f59c49d80067e730c5"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   easy_debounce:
+@@ -461,7 +459,7 @@ packages:
+     description:
+       name: easy_debounce
+       sha256: f082609cfb8f37defb9e37fc28bc978c6712dedf08d4c5a26f820fa10165a236
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.3"
+   encrypt:
+@@ -469,7 +467,7 @@ packages:
+     description:
+       name: encrypt
+       sha256: "62d9aa4670cc2a8798bab89b39fc71b6dfbacf615de6cf5001fb39f7e4a996a2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.3"
+   equatable:
+@@ -477,7 +475,7 @@ packages:
+     description:
+       name: equatable
+       sha256: "3bce007a596ff8b3119c45d68aaef631272537c03d30e5d4534dd24bf4c5eaa2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   extended_nested_scroll_view:
+@@ -494,7 +492,7 @@ packages:
+     description:
+       name: fake_async
+       sha256: "5368f224a74523e8d2e7399ea1638b37aecfca824a3cc4dfdf77bf1fa905ac44"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.3"
+   ffi:
+@@ -502,7 +500,7 @@ packages:
+     description:
+       name: ffi
+       sha256: "6d7fd89431262d8f3125e81b50d3847a091d846eafcd4fdb88dd06f36d705a45"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.0"
+   ffi_leak_tracker:
+@@ -510,7 +508,7 @@ packages:
+     description:
+       name: ffi_leak_tracker
+       sha256: "4093d4ef9ca06ffe2786e73bfb25e22aa92112b9bb4ec941f11e3e6b61489a97"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.1.2"
+   file:
+@@ -518,7 +516,7 @@ packages:
+     description:
+       name: file
+       sha256: a3b4f84adafef897088c160faf7dfffb7696046cb13ae90b508c2cbc95d3b8d4
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.0.1"
+   file_picker:
+@@ -526,23 +524,23 @@ packages:
+     description:
+       name: file_picker
+       sha256: "98c0b156b6380ba55bc767a14e2e6b3feb246e713ad40092424596fa79005bea"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "13.1.0"
+   file_picker_darwin:
+     dependency: transitive
+     description:
+       name: file_picker_darwin
+-      sha256: "576ed6c1148a466913ceef8c19aed71011402351de46acd97732c50e5392f21e"
+-      url: "https://pub.dev"
++      sha256: a5a48960703e7faa880544ef188491f442a93959b6afb5cae57575e5dc836589
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.3.1"
++    version: "2.3.2"
+   file_picker_linux:
+     dependency: transitive
+     description:
+       name: file_picker_linux
+       sha256: e7db600f50672ce5ebbe422ac0906e0f3d2a476188cc93e7126afee12bf08063
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.0"
+   file_picker_platform_interface:
+@@ -550,23 +548,23 @@ packages:
+     description:
+       name: file_picker_platform_interface
+       sha256: "336e7168306834a2b68e6168ed768e00d3fabeac23154d5793e277ca9f97cf20"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.2.0"
+   file_picker_web:
+     dependency: transitive
+     description:
+       name: file_picker_web
+-      sha256: "32af8262aca907b02b8970b32328b0312db0b42ba6f930be6d27fde179d59b7d"
+-      url: "https://pub.dev"
++      sha256: a2288008280aabe371aff029466b3405e60838e0a1d714767488c59b926c8b8c
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "4.1.0"
++    version: "4.2.0"
+   file_selector_linux:
+     dependency: transitive
+     description:
+       name: file_selector_linux
+       sha256: da76400e7872ce7637ffdce12749ec24169c25f6195c28372208e65a24bcd2ab
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.4+1"
+   file_selector_macos:
+@@ -574,7 +572,7 @@ packages:
+     description:
+       name: file_selector_macos
+       sha256: d57c62362766b5e7ae739448650b66c6aab7a68ba7ecc65e04018652645ae0f4
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.5+1"
+   file_selector_platform_interface:
+@@ -582,7 +580,7 @@ packages:
+     description:
+       name: file_selector_platform_interface
+       sha256: "35e0bd61ebcdb91a3505813b055b09b79dfdc7d0aee9c09a7ba59ae4bb13dc85"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.7.0"
+   file_selector_windows:
+@@ -590,7 +588,7 @@ packages:
+     description:
+       name: file_selector_windows
+       sha256: fbefc5fb92c6d3cbe8d284a2cd971b593bb07d2cd6da8557b81a862250b4acec
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.3+6"
+   fixnum:
+@@ -598,7 +596,7 @@ packages:
+     description:
+       name: fixnum
+       sha256: b6dc7065e46c974bc7c5f143080a6764ec7a4be6da1285ececdc37be96de53be
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.1"
+   fl_chart:
+@@ -606,7 +604,7 @@ packages:
+     description:
+       name: fl_chart
+       sha256: b938f77d042cbcd822936a7a359a7235bad8bd72070de1f827efc2cc297ac888
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.0"
+   flex_seed_scheme:
+@@ -614,7 +612,7 @@ packages:
+     description:
+       name: flex_seed_scheme
+       sha256: "08f9ee11f9a08c2dee76d0a07ea824c8a09ea4db9456e32ac4f6dfb34d28392c"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.1"
+   flutter:
+@@ -627,7 +625,7 @@ packages:
+     description:
+       name: flutter_displaymode
+       sha256: ecd44b1e902b0073b42ff5b55bf283f38e088270724cdbb7f7065ccf54aa60a8
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.0"
+   flutter_html:
+@@ -644,7 +642,7 @@ packages:
+     description:
+       name: flutter_inappwebview
+       sha256: "80092d13d3e29b6227e25b67973c67c7210bd5e35c4b747ca908e31eb71a46d5"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.1.5"
+   flutter_inappwebview_android:
+@@ -661,7 +659,7 @@ packages:
+     description:
+       name: flutter_inappwebview_internal_annotations
+       sha256: e30fba942e3debea7b7e6cdd4f0f59ce89dd403a9865193e3221293b6d1544c6
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.0"
+   flutter_inappwebview_ios:
+@@ -669,7 +667,7 @@ packages:
+     description:
+       name: flutter_inappwebview_ios
+       sha256: "5818cf9b26cf0cbb0f62ff50772217d41ea8d3d9cc00279c45f8aabaa1b4025d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.2"
+   flutter_inappwebview_macos:
+@@ -677,7 +675,7 @@ packages:
+     description:
+       name: flutter_inappwebview_macos
+       sha256: c1fbb86af1a3738e3541364d7d1866315ffb0468a1a77e34198c9be571287da1
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.2"
+   flutter_inappwebview_platform_interface:
+@@ -685,7 +683,7 @@ packages:
+     description:
+       name: flutter_inappwebview_platform_interface
+       sha256: cf5323e194096b6ede7a1ca808c3e0a078e4b33cc3f6338977d75b4024ba2500
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.0+1"
+   flutter_inappwebview_web:
+@@ -693,7 +691,7 @@ packages:
+     description:
+       name: flutter_inappwebview_web
+       sha256: "55f89c83b0a0d3b7893306b3bb545ba4770a4df018204917148ebb42dc14a598"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.2"
+   flutter_inappwebview_windows:
+@@ -710,7 +708,7 @@ packages:
+     description:
+       name: flutter_launcher_icons
+       sha256: "10f13781741a2e3972126fae08393d3c4e01fa4cd7473326b94b72cf594195e7"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.14.4"
+   flutter_lints:
+@@ -718,7 +716,7 @@ packages:
+     description:
+       name: flutter_lints
+       sha256: "3105dc8492f6183fb076ccf1f351ac3d60564bff92e20bfc4af9cc1651f4e7e1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.0.0"
+   flutter_localizations:
+@@ -731,7 +729,7 @@ packages:
+     description:
+       name: flutter_native_splash
+       sha256: "9db4b80b044e9af17cc4b1272137fc7ace0054d879ef8210a76adc34aaf4cdff"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.8"
+   flutter_plugin_android_lifecycle:
+@@ -739,7 +737,7 @@ packages:
+     description:
+       name: flutter_plugin_android_lifecycle
+       sha256: "3854fe5e3bff0b113c658f260b90c95dea17c92db0f2addeac2e343dd9969785"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.35"
+   flutter_smart_dialog:
+@@ -765,7 +763,7 @@ packages:
+     description:
+       name: flutter_staggered_grid_view
+       sha256: "19e7abb550c96fbfeb546b23f3ff356ee7c59a019a651f8f102a4ba9b7349395"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.0"
+   flutter_svg:
+@@ -773,7 +771,7 @@ packages:
+     description:
+       name: flutter_svg
+       sha256: "35882981abcbfb8c15b286f0cd690ff25bac12d95eff3e25ee207f37d4c42e7f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.0"
+   flutter_test:
+@@ -786,7 +784,7 @@ packages:
+     description:
+       name: flutter_volume_controller
+       sha256: f9ba12aa17880c1ee3e1668f14eefbc6704e2fed90ed0b2ca97b7dee71133240
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.2"
+   flutter_web_plugins:
+@@ -817,7 +815,7 @@ packages:
+     description:
+       name: glob
+       sha256: "218aeb56050c714f62a3182775320dfa04602b55074873e24e31bbd39bda96fb"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.0"
+   graphs:
+@@ -825,23 +823,23 @@ packages:
+     description:
+       name: graphs
+       sha256: "741bbf84165310a68ff28fe9e727332eef1407342fca52759cb21ad8177bb8d0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.2"
+   hive_ce:
+     dependency: "direct main"
+     description:
+       name: hive_ce
+-      sha256: "940042eeb9b96e93d25a0cd4b463aa487f4e288499fe699506c841087e03ac5d"
+-      url: "https://pub.dev"
++      sha256: "8b6eea82b06a7e2bb298a6a279139c45838b82491a66f3972bf609d48681392a"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.21.0"
++    version: "2.22.0"
+   hooks:
+     dependency: transitive
+     description:
+       name: hooks
+       sha256: eaac480a35ec0814146c2c48d96aaa829e0e44a7662c88ae84c9edf4bc35651f
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.0"
+   html:
+@@ -849,7 +847,7 @@ packages:
+     description:
+       name: html
+       sha256: "43b67b8f43321ab066817dfac5619596c98bb1b61624e77203bb4351785f9699"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.15.7"
+   http:
+@@ -857,7 +855,7 @@ packages:
+     description:
+       name: http
+       sha256: "87721a4a50b19c7f1d49001e51409bddc46303966ce89a65af4f4e6004896412"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.6.0"
+   http2:
+@@ -865,7 +863,7 @@ packages:
+     description:
+       name: http2
+       sha256: "382d3aefc5bd6dc68c6b892d7664f29b5beb3251611ae946a98d35158a82bbfa"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.1"
+   http_multi_server:
+@@ -873,7 +871,7 @@ packages:
+     description:
+       name: http_multi_server
+       sha256: aa6199f908078bb1c5efb8d8638d4ae191aac11b311132c3ef48ce352fb52ef8
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.2"
+   http_parser:
+@@ -881,7 +879,7 @@ packages:
+     description:
+       name: http_parser
+       sha256: "178d74305e7866013777bab2c3d8726205dc5a4dd935297175b19a23a2e66571"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.1.2"
+   image:
+@@ -889,7 +887,7 @@ packages:
+     description:
+       name: image
+       sha256: "89ed75b2f8231fe676808c5564f9590d728024ded7ac782a7ed8474f1c95b72a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.12.0"
+   image_cropper:
+@@ -897,7 +895,7 @@ packages:
+     description:
+       name: image_cropper
+       sha256: "95782c9068ff09b95a5ece6a2b5fb31b18d8e544d79ebfa7bdafc08df39b3440"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "12.2.1"
+   image_cropper_for_web:
+@@ -905,7 +903,7 @@ packages:
+     description:
+       name: image_cropper_for_web
+       sha256: e09749714bc24c4e3b31fbafa2e5b7229b0ff23e8b14d4ba44bd723b77611a0f
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.0.0"
+   image_cropper_platform_interface:
+@@ -913,7 +911,7 @@ packages:
+     description:
+       name: image_cropper_platform_interface
+       sha256: "886a30ec199362cdcc2fbb053b8e53347fbfb9dbbdaa94f9ff85622609f5e7ff"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "8.0.0"
+   image_picker:
+@@ -921,7 +919,7 @@ packages:
+     description:
+       name: image_picker
+       sha256: e71b1bd9e40124041128d60fc3034c7b1598e1bba4e570bba0c70301c817013a
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.4"
+   image_picker_android:
+@@ -929,7 +927,7 @@ packages:
+     description:
+       name: image_picker_android
+       sha256: "8a7823d5d3e884f7780829d85d92110d072bdcd9ed48e2be158d2abe91a912d4"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.8.13+25"
+   image_picker_for_web:
+@@ -937,7 +935,7 @@ packages:
+     description:
+       name: image_picker_for_web
+       sha256: "66257a3191ab360d23a55c8241c91a6e329d31e94efa7be9cf7a212e65850214"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.1"
+   image_picker_ios:
+@@ -945,7 +943,7 @@ packages:
+     description:
+       name: image_picker_ios
+       sha256: "592e5cfed81d73c2784bcaa04db9d06b19371faf036f2afa7f650452025db180"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.8.13+12"
+   image_picker_linux:
+@@ -953,7 +951,7 @@ packages:
+     description:
+       name: image_picker_linux
+       sha256: "1f81c5f2046b9ab724f85523e4af65be1d47b038160a8c8deed909762c308ed4"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   image_picker_macos:
+@@ -961,7 +959,7 @@ packages:
+     description:
+       name: image_picker_macos
+       sha256: "86f0f15a309de7e1a552c12df9ce5b59fe927e71385329355aec4776c6a8ec91"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2+1"
+   image_picker_platform_interface:
+@@ -969,7 +967,7 @@ packages:
+     description:
+       name: image_picker_platform_interface
+       sha256: "2dee4b4e3be429db71472c9c559c981498070a61af1ba82e0e4986fc5dadc042"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.11.2"
+   image_picker_windows:
+@@ -977,7 +975,7 @@ packages:
+     description:
+       name: image_picker_windows
+       sha256: d248c86554a72b5495a31c56f060cf73a41c7ff541689327b1a7dbccc33adfae
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   intl:
+@@ -985,7 +983,7 @@ packages:
+     description:
+       name: intl
+       sha256: "1ca20c894b1717686a2319b8548763d812bc0aabdac580420a44c5178c57a867"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.20.3"
+   io:
+@@ -993,7 +991,7 @@ packages:
+     description:
+       name: io
+       sha256: "2635216ca6a737e60de577ffa1a48a0bec76ca8a62917cfc1bb88c14c570646f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   isolate_channel:
+@@ -1001,7 +999,7 @@ packages:
+     description:
+       name: isolate_channel
+       sha256: a9d3d620695bc984244dafae00b95e4319d6974b2d77f4b9e1eb4f2efe099094
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.6.1"
+   jni:
+@@ -1009,7 +1007,7 @@ packages:
+     description:
+       name: jni
+       sha256: "6b9ca0602fef0230e83149afbe3f9f8227e94f2bbe84a1da4f14d699742f402d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   jni_flutter:
+@@ -1017,7 +1015,7 @@ packages:
+     description:
+       name: jni_flutter
+       sha256: "0dd33d67797560f66e961a6053882d4df54bd345bf063b8fe7ea133f7ad8b191"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.4+1"
+   jni_util:
+@@ -1025,7 +1023,7 @@ packages:
+     description:
+       name: jni_util
+       sha256: "1ba86da04a5f2bf18fde2edb235587e70c5b0fc5bd4ba955f46b00942c3fc35f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.0"
+   jnigen:
+@@ -1033,7 +1031,7 @@ packages:
+     description:
+       name: jnigen
+       sha256: "2055cf3b8a9e800af37f1ede3e9f86c02695f7bbb4f3bed3eab0457c14b75580"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.1"
+   js:
+@@ -1041,7 +1039,7 @@ packages:
+     description:
+       name: js
+       sha256: "53385261521cc4a0c4658fd0ad07a7d14591cf8fc33abbceae306ddb974888dc"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.2"
+   json_annotation:
+@@ -1049,7 +1047,7 @@ packages:
+     description:
+       name: json_annotation
+       sha256: "2a743920d81b7910627f68ee2c9ac1fc0bfee32b9fc3403587d7c6791ca12f80"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.12.0"
+   leak_tracker:
+@@ -1057,7 +1055,7 @@ packages:
+     description:
+       name: leak_tracker
+       sha256: "33e2e26bdd85a0112ec15400c8cbffea70d0f9c3407491f672a2fad47915e2de"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "11.0.2"
+   leak_tracker_flutter_testing:
+@@ -1065,7 +1063,7 @@ packages:
+     description:
+       name: leak_tracker_flutter_testing
+       sha256: "1dbc140bb5a23c75ea9c4811222756104fbcd1a27173f0c34ca01e16bea473c1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.10"
+   leak_tracker_testing:
+@@ -1073,7 +1071,7 @@ packages:
+     description:
+       name: leak_tracker_testing
+       sha256: "8d5a2d49f4a66b49744b23b018848400d23e54caf9463f4eb20df3eb8acb2eb1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.2"
+   lints:
+@@ -1081,7 +1079,7 @@ packages:
+     description:
+       name: lints
+       sha256: "12f842a479589fea194fe5c5a3095abc7be0c1f2ddfa9a0e76aed1dbd26a87df"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.1.0"
+   list_counter:
+@@ -1089,7 +1087,7 @@ packages:
+     description:
+       name: list_counter
+       sha256: c447ae3dfcd1c55f0152867090e67e219d42fe6d4f2807db4bbe8b8d69912237
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.2"
+   live_photo_maker:
+@@ -1097,7 +1095,7 @@ packages:
+     description:
+       name: live_photo_maker
+       sha256: "9af3965bd9d2ab55b0d4d0a1e4041fdcc9ef6c6c44543c8412667541a054f58b"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.0.6"
+   logger:
+@@ -1105,7 +1103,7 @@ packages:
+     description:
+       name: logger
+       sha256: "2a0dc097e7b01d942475bdd552356db2d0f768b05540bd4b2b53f1840f2239a7"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.8.0"
+   logging:
+@@ -1113,7 +1111,7 @@ packages:
+     description:
+       name: logging
+       sha256: c8245ada5f1717ed44271ed1c26b8ce85ca3228fd2ffdb75468ab01979309d61
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.0"
+   matcher:
+@@ -1121,7 +1119,7 @@ packages:
+     description:
+       name: matcher
+       sha256: "31bd099b47c10cd1aeb55146a2d46ce0277630ecef3f7dae54ad7873f36696cd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.12.20"
+   material_color_utilities:
+@@ -1129,7 +1127,7 @@ packages:
+     description:
+       name: material_color_utilities
+       sha256: "9c337007e82b1889149c82ed242ed1cb24a66044e30979c44912381e9be4c48b"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.13.0"
+   material_design_icons_flutter:
+@@ -1146,17 +1144,17 @@ packages:
+     description:
+       name: material_new_shapes
+       sha256: e4bc375205e187e8fb232573387112dd8c0dd45b03af8aa2b3c79eb4b9e3e0dc
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.0"
+   material_ui:
+     dependency: "direct main"
+     description:
+       name: material_ui
+-      sha256: "98ab9eda579ecae623e4b376c603035c5def78ce706f735f30bd632af5814695"
+-      url: "https://pub.dev"
++      sha256: "27ea1af251a79728ee63068417f2ab469d294931a9bb8366ba8b85b0ef839060"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.6.0"
++    version: "1.7.0"
+   media_kit:
+     dependency: "direct main"
+     description:
+@@ -1189,7 +1187,7 @@ packages:
+     description:
+       name: media_kit_libs_linux
+       sha256: "2b473399a49ec94452c4d4ae51cfc0f6585074398d74216092bf3d54aac37ecf"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.1"
+   media_kit_libs_macos_video:
+@@ -1197,7 +1195,7 @@ packages:
+     description:
+       name: media_kit_libs_macos_video
+       sha256: f26aa1452b665df288e360393758f84b911f70ffb3878032e1aabba23aa1032d
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.4"
+   media_kit_libs_video:
+@@ -1241,7 +1239,7 @@ packages:
+     description:
+       name: meta
+       sha256: "307249ce4ff29d58a18e97f6345f539382eb9c9c29ecda628900f31de0443dd9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.19.0"
+   mime:
+@@ -1249,7 +1247,7 @@ packages:
+     description:
+       name: mime
+       sha256: bd47de35f07e27267e69c8c8b22edf9473bfee170a60d60fcc93730c5144b7f6
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   native_device_orientation:
+@@ -1266,7 +1264,7 @@ packages:
+     description:
+       name: native_toolchain_c
+       sha256: "90eaad8059ebc2004a63810a4696ea9acdb02473e47ed3b6b3bafb100ac77e31"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.19.5"
+   nativeapi:
+@@ -1274,7 +1272,7 @@ packages:
+     description:
+       name: nativeapi
+       sha256: c4625e81f5ce2f4a9044c0ec1bdb38355119ffcf89e24eb20ae9fc5027a01e59
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.2"
+   nativeapi_flutter:
+@@ -1282,7 +1280,7 @@ packages:
+     description:
+       name: nativeapi_flutter
+       sha256: "4feaa68cb5c4fc3b2eeaee1a25e56e2d092178e1c59516d9db5dd34940dcf36c"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.2"
+   nm:
+@@ -1290,7 +1288,7 @@ packages:
+     description:
+       name: nm
+       sha256: "2c9aae4127bdc8993206464fcc063611e0e36e72018696cd9631023a31b24254"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.0"
+   objective_c:
+@@ -1298,7 +1296,7 @@ packages:
+     description:
+       name: objective_c
+       sha256: "5c80c2ad6e2c0397de5db38c6d653e69616a3397e13aa7633bf39eb668f2041b"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "9.6.2"
+   octo_image:
+@@ -1315,7 +1313,7 @@ packages:
+     description:
+       name: package_config
+       sha256: ffcf4cf3d6c0b74ac43708d9f56625506e8a68aa935abe9d267a7330f320eb5d
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.0"
+   package_info_plus:
+@@ -1323,7 +1321,7 @@ packages:
+     description:
+       name: package_info_plus
+       sha256: "73ef2cd5c11a7548f9b7f6fc2a4f6113de2e64aa2a70de63feede95548822908"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "10.2.2"
+   package_info_plus_platform_interface:
+@@ -1331,7 +1329,7 @@ packages:
+     description:
+       name: package_info_plus_platform_interface
+       sha256: db762cb2f4f25ee60fb6359773861b0f199e00b90d237bd85a76a1e806b46ef4
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.1.0"
+   path:
+@@ -1339,7 +1337,7 @@ packages:
+     description:
+       name: path
+       sha256: "75cca69d1490965be98c73ceaea117e8a04dd21217b37b292c9ddbec0d955bc5"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.9.1"
+   path_parsing:
+@@ -1347,7 +1345,7 @@ packages:
+     description:
+       name: path_parsing
+       sha256: "883402936929eac138ee0a45da5b0f2c80f89913e6dc3bf77eb65b84b409c6ca"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   path_provider:
+@@ -1355,7 +1353,7 @@ packages:
+     description:
+       name: path_provider
+       sha256: a7f4874f987173da295a61c181b8ee71dab59b332a486b391babf26a1b884825
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.6"
+   path_provider_android:
+@@ -1363,7 +1361,7 @@ packages:
+     description:
+       name: path_provider_android
+       sha256: "69cbd515a62b94d32a7944f086b2f82b4ac40a1d45bebfc00813a430ab2dabcd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.1"
+   path_provider_foundation:
+@@ -1371,7 +1369,7 @@ packages:
+     description:
+       name: path_provider_foundation
+       sha256: "2a376b7d6392d80cd3705782d2caa734ca4727776db0b6ec36ef3f1855197699"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.6.0"
+   path_provider_linux:
+@@ -1379,7 +1377,7 @@ packages:
+     description:
+       name: path_provider_linux
+       sha256: "58c2005f147315b11e9b4a7bc889cd5203e250cba8e3f012dae259b4972b5c16"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.2"
+   path_provider_platform_interface:
+@@ -1387,7 +1385,7 @@ packages:
+     description:
+       name: path_provider_platform_interface
+       sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.3"
+   path_provider_windows:
+@@ -1395,7 +1393,7 @@ packages:
+     description:
+       name: path_provider_windows
+       sha256: bd6f00dbd873bfb70d0761682da2b3a2c2fccc2b9e84c495821639601d81afe7
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.0"
+   permission_handler_android:
+@@ -1403,7 +1401,7 @@ packages:
+     description:
+       name: permission_handler_android
+       sha256: b1ce660f4d0dcaffdf2605a19544c129fb5adda4e6fd039992ae356c4e437039
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "14.1.0"
+   permission_handler_apple:
+@@ -1411,7 +1409,7 @@ packages:
+     description:
+       name: permission_handler_apple
+       sha256: "066bbbc60031b63b916a3871e7bb4b6a8c5e7cec8146dafec53d1da304eff0a5"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "9.6.2"
+   permission_handler_platform_interface:
+@@ -1419,7 +1417,7 @@ packages:
+     description:
+       name: permission_handler_platform_interface
+       sha256: ed86a61c190258fdd65de395ea0632822e3415c1faec38eae0c31b479c28a531
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.4.1"
+   petitparser:
+@@ -1427,7 +1425,7 @@ packages:
+     description:
+       name: petitparser
+       sha256: "2f1564aadb14215e478563b5406cb80729d022158c01dc50c96013c2f7eb4790"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.1.0"
+   platform:
+@@ -1435,7 +1433,7 @@ packages:
+     description:
+       name: platform
+       sha256: a36d119c13416516a7b5913fbe8af8531e11633d784c550b2125f76c758524ec
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.0"
+   plugin_platform_interface:
+@@ -1443,7 +1441,7 @@ packages:
+     description:
+       name: plugin_platform_interface
+       sha256: "4820fbfdb9478b1ebae27888254d445073732dae3d6ea81f0b7e06d5dedc3f02"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.8"
+   pointycastle:
+@@ -1451,7 +1449,7 @@ packages:
+     description:
+       name: pointycastle
+       sha256: "4be0097fcf3fd3e8449e53730c631200ebc7b88016acecab2b0da2f0149222fe"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.9.1"
+   pool:
+@@ -1459,7 +1457,7 @@ packages:
+     description:
+       name: pool
+       sha256: "4177f68c237ea2128d1bee66ac17b2ce05ba3dbaafcbdd54c5d40a39d0b6b11c"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.5.3"
+   posix:
+@@ -1467,7 +1465,7 @@ packages:
+     description:
+       name: posix
+       sha256: bc1bad54ad2b735816e31f8d4600cfde6c7839975085ddfbca48b6c9f7c4044e
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.5.2"
+   pretty_qr_code:
+@@ -1475,7 +1473,7 @@ packages:
+     description:
+       name: pretty_qr_code
+       sha256: "474f8a4512113fba06f14a6ec9bbf42353b4e651d7a520e3096f2a9b6bbe7a8a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.6.0"
+   process:
+@@ -1483,7 +1481,7 @@ packages:
+     description:
+       name: process
+       sha256: "4242ba3508d37e01808bdf71ad1d5bb93a8d671bf2e7450e6b1b353fb0808891"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.6"
+   protobuf:
+@@ -1491,7 +1489,7 @@ packages:
+     description:
+       name: protobuf
+       sha256: "13b6717366aa7ec3792dd62c19c7d33a785708224365f2db23c5ca01f1c1a0f2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.1.0"
+   pub_semver:
+@@ -1499,7 +1497,7 @@ packages:
+     description:
+       name: pub_semver
+       sha256: "261236774e8b1d69cfc6b9eabbc96c40f25e7a2d6b171f3385d4f65d5734fb24"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.1"
+   pubspec_parse:
+@@ -1507,7 +1505,7 @@ packages:
+     description:
+       name: pubspec_parse
+       sha256: c38b81cbf34450b67e0265d73433569d12e34782e30ed769c9cc99c9d5f2e796
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.6.0"
+   qr:
+@@ -1515,7 +1513,7 @@ packages:
+     description:
+       name: qr
+       sha256: "5a1d2586170e172b8a8c8470bbbffd5eb0cd38a66c0d77155ea138d3af3a4445"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.2"
+   re_highlight:
+@@ -1523,7 +1521,7 @@ packages:
+     description:
+       name: re_highlight
+       sha256: "6c4ac3f76f939fb7ca9df013df98526634e17d8f7460e028bd23a035870024f2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.0.3"
+   record_use:
+@@ -1531,7 +1529,7 @@ packages:
+     description:
+       name: record_use
+       sha256: "1cb8564af8d43b464294411db9217f5ec04891c6f22ee2c32d73ae05e88a6bd2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.1"
+   rxdart:
+@@ -1539,7 +1537,7 @@ packages:
+     description:
+       name: rxdart
+       sha256: "5c3004a4a8dbb94bd4bf5412a4def4acdaa12e12f269737a5751369e12d1a962"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.28.0"
+   saver_gallery:
+@@ -1547,7 +1545,7 @@ packages:
+     description:
+       name: saver_gallery
+       sha256: dcecd87113ffcb0eb467bb0ef5ed8f6dd894e26ff3dfd5822624281e7d2cb894
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.1.0"
+   screen_brightness_android:
+@@ -1555,7 +1553,7 @@ packages:
+     description:
+       name: screen_brightness_android
+       sha256: "2008ad8e9527cc968f7a4de1ec58b476d495b3c612a149dbd6550c4f046da147"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.6"
+   screen_brightness_ios:
+@@ -1563,7 +1561,7 @@ packages:
+     description:
+       name: screen_brightness_ios
+       sha256: "352d355e8523a186ba1e494b74218e5ca96e51975a0630b8ed89fbb7ff609762"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.4"
+   screen_brightness_platform_interface:
+@@ -1571,7 +1569,7 @@ packages:
+     description:
+       name: screen_brightness_platform_interface
+       sha256: "2de60c0ba569b898950029cc1f7e9dd72bda44a22beb5054aac331cb6fce2ff2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.2"
+   screen_retriever:
+@@ -1579,7 +1577,7 @@ packages:
+     description:
+       name: screen_retriever
+       sha256: e409a9247218b4c4772d05719144787aad35fc299b216d07e41647d9f35acc5b
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.3.0"
+   share_plus:
+@@ -1587,7 +1585,7 @@ packages:
+     description:
+       name: share_plus
+       sha256: db40767f130189d53f3ae8a6393c217ff4a492da1baff718a9873679c0c00224
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "13.3.1"
+   share_plus_platform_interface:
+@@ -1595,7 +1593,7 @@ packages:
+     description:
+       name: share_plus_platform_interface
+       sha256: "365ef7379fc22507256adda3385152942ffce08935452bc972c2e52a0bebae41"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.2.0"
+   shared_preferences:
+@@ -1603,31 +1601,31 @@ packages:
+     description:
+       name: shared_preferences
+       sha256: "1e85e0dccf5b4a016077fea7dfbb4a7cb39c759ac1596fcf60c06deadb7da91f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.5.6"
+   shared_preferences_android:
+     dependency: transitive
+     description:
+       name: shared_preferences_android
+-      sha256: "1e12aafe408aa50da80edfd679a2a6bf63ba7ab37c7fa98286da459a757b3399"
+-      url: "https://pub.dev"
++      sha256: b90caa27669d5f3ef9918d55343b44000f088ee9d4685ed822310848004c793e
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.4.28"
++    version: "2.5.0"
+   shared_preferences_foundation:
+     dependency: transitive
+     description:
+       name: shared_preferences_foundation
+-      sha256: "2ec3934efa51e46117f23031cc141b8fc878e8525b94ec1ea4f7f586cf1b47ea"
+-      url: "https://pub.dev"
++      sha256: c2c02dd59bd7b3bb6bfb77aa7ad4a7886b24ee40e95dcaea754b83274b567ff5
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.5.7"
++    version: "2.6.0"
+   shared_preferences_linux:
+     dependency: transitive
+     description:
+       name: shared_preferences_linux
+       sha256: "580abfd40f415611503cae30adf626e6656dfb2f0cee8f465ece7b6defb40f2f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.1"
+   shared_preferences_platform_interface:
+@@ -1635,7 +1633,7 @@ packages:
+     description:
+       name: shared_preferences_platform_interface
+       sha256: "649dc798a33931919ea356c4305c2d1f81619ea6e92244070b520187b5140ef9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.2"
+   shared_preferences_web:
+@@ -1643,7 +1641,7 @@ packages:
+     description:
+       name: shared_preferences_web
+       sha256: c49bd060261c9a3f0ff445892695d6212ff603ef3115edbb448509d407600019
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   shared_preferences_windows:
+@@ -1651,23 +1649,23 @@ packages:
+     description:
+       name: shared_preferences_windows
+       sha256: "94ef0f72b2d71bc3e700e025db3710911bd51a71cefb65cc609dd0d9a982e3c1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.1"
+   shelf:
+     dependency: transitive
+     description:
+       name: shelf
+-      sha256: e7dd780a7ffb623c57850b33f43309312fc863fb6aa3d276a754bb299839ef12
+-      url: "https://pub.dev"
++      sha256: e75e9cf311d7fd712048038cc17c25199c38536c20330d53e7db058b543d5a48
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.4.2"
++    version: "1.4.3"
+   shelf_web_socket:
+     dependency: transitive
+     description:
+       name: shelf_web_socket
+       sha256: "3632775c8e90d6c9712f883e633716432a27758216dfb61bd86a8321c0580925"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.0"
+   sky_engine:
+@@ -1680,7 +1678,7 @@ packages:
+     description:
+       name: source_span
+       sha256: "56a02f1f4cd1a2d96303c0144c93bd6d909eea6bee6bf5a0e0b685edbd4c47ab"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.10.2"
+   stack_trace:
+@@ -1688,7 +1686,7 @@ packages:
+     description:
+       name: stack_trace
+       sha256: "277654b3034d17ac6f9f1cb5595db011b1d5d41e8806866db28e0abaa101c490"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.12.2"
+   stream_channel:
+@@ -1696,7 +1694,7 @@ packages:
+     description:
+       name: stream_channel
+       sha256: "969e04c80b8bcdf826f8f16579c7b14d780458bd97f56d107d3950fdbeef059d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.4"
+   stream_transform:
+@@ -1704,7 +1702,7 @@ packages:
+     description:
+       name: stream_transform
+       sha256: a00e5f18bffc764f923e7dec1038527f7fe7a1791361a7117f0358193f13d53a
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.2"
+   string_scanner:
+@@ -1712,7 +1710,7 @@ packages:
+     description:
+       name: string_scanner
+       sha256: "921cd31725b72fe181906c6a94d987c78e3b98c2e205b397ea399d4054872b43"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.1"
+   super_sliver_list:
+@@ -1729,7 +1727,7 @@ packages:
+     description:
+       name: synchronized
+       sha256: b3d516dbd3757ff2a458735e4f6cbac9ff261f576f6e87bcb17feabb39e657c5
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.5.0"
+   term_glyph:
+@@ -1737,7 +1735,7 @@ packages:
+     description:
+       name: term_glyph
+       sha256: "7f554798625ea768a7518313e58f83891c7f5024f88e46e7182a4558850a4b8e"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.2"
+   test_api:
+@@ -1745,7 +1743,7 @@ packages:
+     description:
+       name: test_api
+       sha256: "2a122cbe059f8b610d3a5415f42e255b6c17b1f21eee1d960f31080237fb4f11"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.12"
+   tray_manager:
+@@ -1753,7 +1751,7 @@ packages:
+     description:
+       name: tray_manager
+       sha256: "4be089ac5fbca1c1724ea2b28a4827ff84f217956558d4eaf9441fd231c160a0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.8.0"
+   typed_data:
+@@ -1761,7 +1759,7 @@ packages:
+     description:
+       name: typed_data
+       sha256: f9049c039ebfeb4cf7a7104a675823cd72dba8297f264b6637062516699fa006
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.0"
+   universal_io:
+@@ -1769,7 +1767,7 @@ packages:
+     description:
+       name: universal_io
+       sha256: f63cbc48103236abf48e345e07a03ce5757ea86285ed313a6a032596ed9301e2
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.1"
+   upower:
+@@ -1777,7 +1775,7 @@ packages:
+     description:
+       name: upower
+       sha256: cf042403154751180affa1d15614db7fa50234bc2373cd21c3db666c38543ebf
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.0"
+   url_launcher:
+@@ -1785,7 +1783,7 @@ packages:
+     description:
+       name: url_launcher
+       sha256: e8cc955c97e06df9879140a1fe301f3d493f01b7c62dec7f46834be31d7e9fda
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.3.3"
+   url_launcher_android:
+@@ -1793,7 +1791,7 @@ packages:
+     description:
+       name: url_launcher_android
+       sha256: "611e87fb320b70d1dd721dc46af89c98aceccea9b31fde49e084591414e0c610"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.3.33"
+   url_launcher_ios:
+@@ -1801,7 +1799,7 @@ packages:
+     description:
+       name: url_launcher_ios
+       sha256: "8faa1aab294f1ab4040b43660c887b0418d5fa4f0cffef76a484e6aa1092eb4a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.4.2"
+   url_launcher_linux:
+@@ -1809,7 +1807,7 @@ packages:
+     description:
+       name: url_launcher_linux
+       sha256: "10f86fef4c2c43563fa6c211ff9cf757adf4d3ab762c56bd430664a947d70cd0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.3"
+   url_launcher_macos:
+@@ -1817,7 +1815,7 @@ packages:
+     description:
+       name: url_launcher_macos
+       sha256: "5e835a3b869c2d70325349c81c5a45c28e20791265b67b2669da6b08c5cd5201"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.6"
+   url_launcher_platform_interface:
+@@ -1825,7 +1823,7 @@ packages:
+     description:
+       name: url_launcher_platform_interface
+       sha256: "552f8a1e663569be95a8190206a38187b531910283c3e982193e4f2733f01029"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.2"
+   url_launcher_web:
+@@ -1833,7 +1831,7 @@ packages:
+     description:
+       name: url_launcher_web
+       sha256: "85c81589622fbc87c1c683aaea164d3604a7777495a79d91e39ffcdec39ddb34"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   url_launcher_windows:
+@@ -1841,7 +1839,7 @@ packages:
+     description:
+       name: url_launcher_windows
+       sha256: "6c5ad3f22cd4c38e089b81963b3cd7bb83b111b2df5dce008bb066162f42e429"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.6"
+   uuid:
+@@ -1849,7 +1847,7 @@ packages:
+     description:
+       name: uuid
+       sha256: "9b129329f58692f6e6578329498a8fe9fbe98f090beb764ffbb8ee2eadd01dcd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.6.0"
+   vector_graphics:
+@@ -1857,7 +1855,7 @@ packages:
+     description:
+       name: vector_graphics
+       sha256: "9d0e3b9cb16542ad660daee871e726a10d13a93b7b5391677c3160e8f5e83935"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.3"
+   vector_graphics_codec:
+@@ -1865,39 +1863,39 @@ packages:
+     description:
+       name: vector_graphics_codec
+       sha256: "99fd9fbd34d9f9a32efd7b6a6aae14125d8237b10403b422a6a6dfeac2806146"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.13"
+   vector_graphics_compiler:
+     dependency: transitive
+     description:
+       name: vector_graphics_compiler
+-      sha256: "670a59098f5c4c9f8eab25edba4f72e1bc8172b428b012339ac892eb31c68f2b"
+-      url: "https://pub.dev"
++      sha256: a8e2c19796144da2f81bcc96dad1bb19c4677b561c452081b97ee737b9faed65
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.3.1"
++    version: "1.3.2"
+   vector_math:
+     dependency: "direct main"
+     description:
+       name: vector_math
+       sha256: "92b9910f66ed1057fd4da7b040ae7c74cafacf885bdc81be496928d5049b032d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   vm_service:
+     dependency: transitive
+     description:
+       name: vm_service
+-      sha256: "5f37239c4851efcef929cea7824e76df7f2f0970aef85d66bbc430afa40e72f0"
+-      url: "https://pub.dev"
++      sha256: "89b11d62e1040ee681af3b4f1c97a803ecbf010c6e8b9c5896ee5b08c3bf7b78"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "15.3.0"
++    version: "15.4.0"
+   wakelock_plus:
+     dependency: "direct main"
+     description:
+       name: wakelock_plus
+       sha256: "22b3e7e937721de70e63c85e7139f4ac781dc22863b9262431a53ac030eb074b"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.8.0"
+   wakelock_plus_platform_interface:
+@@ -1905,7 +1903,7 @@ packages:
+     description:
+       name: wakelock_plus_platform_interface
+       sha256: "764c25504562abc8ac3406f5d175f126b276e6ba916c7c2675690b73368ca384"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.7.0"
+   watcher:
+@@ -1913,7 +1911,7 @@ packages:
+     description:
+       name: watcher
+       sha256: "1398c9f081a753f9226febe8900fce8f7d0a67163334e1c94a2438339d79d635"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.1"
+   web:
+@@ -1921,7 +1919,7 @@ packages:
+     description:
+       name: web
+       sha256: "868d88a33d8a87b18ffc05f9f030ba328ffefba92d6c127917a2ba740f9cfe4a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.1"
+   web_socket:
+@@ -1929,7 +1927,7 @@ packages:
+     description:
+       name: web_socket
+       sha256: "34d64019aa8e36bf9842ac014bb5d2f5586ca73df5e4d9bf5c936975cae6982c"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.1"
+   web_socket_channel:
+@@ -1937,7 +1935,7 @@ packages:
+     description:
+       name: web_socket_channel
+       sha256: d645757fb0f4773d602444000a8131ff5d48c9e47adfe9772652dd1a4f2d45c8
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.3"
+   webdav_client:
+@@ -1954,7 +1952,7 @@ packages:
+     description:
+       name: win32
+       sha256: a0b93865d5644f11cf6a8c3f6db909f1ec168958b5805f6cc684adea957cd63d
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.4.0"
+   win32_registry:
+@@ -1962,7 +1960,7 @@ packages:
+     description:
+       name: win32_registry
+       sha256: "73b1d78920a9d6e03f8b4e43e612b87bf3152a0e5c5e5150267762b7c4116904"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.3"
+   window_manager:
+@@ -1979,7 +1977,7 @@ packages:
+     description:
+       name: windows_file_picker
+       sha256: "18452aa293de3b6961c6d05b0e71b4be7bb90c67635abdd3aa5c4e75dd875072"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.1"
+   xdg_directories:
+@@ -1987,7 +1985,7 @@ packages:
+     description:
+       name: xdg_directories
+       sha256: "7a3f37b05d989967cdddcbb571f1ea834867ae2faa29725fd085180e0883aa15"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   xml:
+@@ -1995,7 +1993,7 @@ packages:
+     description:
+       name: xml
+       sha256: "971043b3a0d3da28727e40ed3e0b5d18b742fa5a68665cca88e74b7876d5e025"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.6.1"
+   yaml:
+@@ -2003,7 +2001,7 @@ packages:
+     description:
+       name: yaml
+       sha256: f67cdd8e07d3c6329146aaef1ba043542b3134c12489f553ca9a7435d1068aea
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.4"
+ sdks:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 8af64ab..11ad211 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -1,277 +1,280 @@
+-name: PiliPlus
+-description: A new Flutter project.
+-# The following line prevents the package from being accidentally published to
+-# pub.dev using `flutter pub publish`. This is preferred for private packages.
+-publish_to: "none" # Remove this line if you wish to publish to pub.dev
+-
+-# The following defines the version and build number for your application.
+-# A version number is three numbers separated by dots, like 1.2.43
+-# followed by an optional build number separated by a +.
+-# Both the version and the builder number may be overridden in flutter
+-# build by specifying --build-name and --build-number, respectively.
+-# In Android, build-name is used as versionName while build-number used as versionCode.
+-# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+-# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+-# Read more about iOS versioning at
+-# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+-# In Windows, build-name is used as the major, minor, and patch parts
+-# of the product and file versions while build-number is used as the build suffix.
+-# update when release
++﻿name: PiliPlus
++description: A new Flutter project.
++# The following line prevents the package from being accidentally published to
++# pub.dev using `flutter pub publish`. This is preferred for private packages.
++publish_to: "none" # Remove this line if you wish to publish to pub.dev
++
++# The following defines the version and build number for your application.
++# A version number is three numbers separated by dots, like 1.2.43
++# followed by an optional build number separated by a +.
++# Both the version and the builder number may be overridden in flutter
++# build by specifying --build-name and --build-number, respectively.
++# In Android, build-name is used as versionName while build-number used as versionCode.
++# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
++# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
++# Read more about iOS versioning at
++# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
++# In Windows, build-name is used as the major, minor, and patch parts
++# of the product and file versions while build-number is used as the build suffix.
++# update when release
+ version: 2.1.6+1
+-
+-environment:
+-  sdk: ">=3.13.0"
+-  flutter: 3.47.7
+-
+-# Dependencies specify other packages that your package needs in order to work.
+-# To automatically upgrade your package dependencies to the latest versions
+-# consider running `flutter pub upgrade --major-versions`. Alternatively,
+-# dependencies can be manually updated by changing the version numbers below to
+-# the latest version available on pub.dev. To see which dependencies have newer
+-# versions available, run `flutter pub outdated`.
+-dependencies:
+-  flutter:
+-    sdk: flutter
+-  flutter_localizations:
+-    sdk: flutter
+-
+-  app_links: ^7.1.1
+-  archive: ^4.0.0
+-  audio_service:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/audio_service.git
+-      path: audio_service
+-      ref: dev
+-  audio_session:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/audio_session.git
+-      ref: dev
+-  battery_plus: ^7.0.0
+-  brotli: ^0.6.0
+-  cached_network_image_ce:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_cached_network_image_ce.git
+-      path: cached_network_image
+-      ref: develop
+-  canvas_danmaku:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/canvas_danmaku.git
+-      ref: main
+-  catcher_2:
+-    git:
+-      url: https://github.com/My-Responsitories/catcher_2.git
+-      ref: dev
+-  characters: ^1.4.1
+-  chat_bottom_container:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_chat_packages.git
+-      path: packages/chat_bottom_container
+-      ref: dev
+-  collection: ^1.19.1
+-  connectivity_plus: ^7.1.1
+-  cookie_jar: ^4.0.8
+-  crypto: ^3.0.6
+-  cupertino_ui: ^1.0.0
+-  device_info_plus: ^13.1.0
+-  dio: ^5.9.1
+-  dio_http2_adapter: ^2.7.1
+-  dlna_dart: ^0.1.0
+-  dynamic_color: ^2.1.0
+-  easy_debounce: ^2.0.3
+-  encrypt: ^5.0.3
+-  extended_nested_scroll_view:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/extended_nested_scroll_view.git
+-      ref: dev
+-  ffi: ^2.2.0
+-  file_picker: ^13.1.0
+-  fixnum: ^1.1.1
+-  fl_chart: ^1.0.0
+-  flex_seed_scheme: ^5.0.0
+-  flutter_displaymode: ^0.7.0
+-  flutter_html:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_html.git
+-      ref: dev
+-  flutter_inappwebview: ^6.1.5
+-  flutter_smart_dialog:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_smart_dialog.git
+-      ref: main
+-  flutter_sortable_wrap:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_sortable_wrap.git
+-      ref: master
+-  flutter_staggered_grid_view: ^0.7.0
+-  flutter_svg: ^2.0.14
+-  flutter_volume_controller: ^2.0.0
+-  font_awesome_flutter:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/font_awesome_flutter.git
+-      ref: v10.9.0
+-  get:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/getx.git
+-      ref: dev
+-  hive_ce: ^2.19.3
+-  html: ^0.15.4
+-  http2: ^2.3.1
+-  image_cropper: ^12.0.0
+-  image_picker: ^1.1.2
+-  intl: ^0.20.2
+-  jni: ^1.0.0
+-  json_annotation: ^4.11.0
+-  live_photo_maker: ^0.0.6
+-  logger: ^2.5.0
+-  material_color_utilities: ^0.13.0
+-  material_design_icons_flutter:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/material_design_icons_flutter.git
+-      ref: const
+-  material_new_shapes: ^1.0.0
+-  material_ui: ^1.0.0
+-  media_kit: 1.1.11
+-  media_kit_libs_video: 1.0.5
+-  media_kit_video: 1.2.5
+-  mime: ^2.0.0
+-  nativeapi: ^0.5.2
+-  native_device_orientation:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_native_device_orientation.git
+-      ref: master
+-  package_info_plus: ^10.1.0
+-  path: ^1.9.1
+-  path_provider: ^2.1.5
+-  path_provider_platform_interface: ^2.1.3
+-  permission_handler_android: ^14.0.0
+-  permission_handler_apple: ^9.4.7
+-  permission_handler_platform_interface: ^4.3.0
+-  pretty_qr_code: ^3.3.0
+-  protobuf: ^6.0.0
+-  re_highlight: ^0.0.3
+-  saver_gallery: ^5.0.2
+-  screen_brightness_platform_interface: ^2.1.0
+-  screen_retriever: ^0.3.0
+-  share_plus: ^13.1.0
+-  stream_transform: ^2.1.1
+-  super_sliver_list:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/super_sliver_list.git
+-      ref: mod
+-  synchronized: ^3.3.0
+-  tray_manager: ^0.8.0
+-  url_launcher: ^6.3.1
+-  uuid: ^4.5.1
+-  vector_math: ^2.2.0
+-  wakelock_plus: ^1.2.8
+-  web_socket_channel: ^3.0.3
+-  webdav_client:
+-    git:
+-      url: https://github.com/wgh136/webdav_client.git
+-      ref: main
+-  win32: ^6.3.0
+-  window_manager:
+-    git:
+-      url: https://github.com/leanflutter/window_manager.git
+-      ref: main
+-
+-dependency_overrides:
+-  flutter_inappwebview_android:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_inappwebview.git
+-      path: flutter_inappwebview_android
+-      ref: v6.1.5
+-  flutter_inappwebview_windows:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/flutter_inappwebview.git
+-      path: flutter_inappwebview_windows
+-      ref: v6.1.5
+-  media_kit:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: media_kit
+-      ref: native
+-  media_kit_libs_android_video:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: libs/android/media_kit_libs_android_video
+-      ref: native
+-  media_kit_libs_ios_video:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: libs/ios/media_kit_libs_ios_video
+-      ref: native
+-  media_kit_libs_video:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: libs/universal/media_kit_libs_video
+-      ref: native
+-  media_kit_libs_windows_video:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: libs/windows/media_kit_libs_windows_video
+-      ref: native
+-  media_kit_native_event_loop:
+-    git:
+-      url: https://github.com/My-Responsitories/media-kit.git
+-      path: media_kit_native_event_loop
+-      ref: native
+-  media_kit_video:
+-    git:
+-      url: https://github.com/bggRGjQaUbCoE/media-kit.git
+-      path: media_kit_video
+-      ref: native
+-
+-dev_dependencies:
+-  flutter_test:
+-    sdk: flutter
+-  build_runner: ^2.10.3
+-  flutter_launcher_icons: ^0.14.4
+-  flutter_lints: ^6.0.0
+-  flutter_native_splash: ^2.4.6
+-  jnigen: ^1.0.0
+-
+-flutter_launcher_icons:
+-  android: true
+-  ios: true
+-  remove_alpha_ios: true
+-  image_path: assets/images/logo/logo_2.png
+-  image_path_android: assets/images/logo/logo_2.png
+-  image_path_ios: assets/images/logo/logo.png
+-  adaptive_icon_background: "#ffffff"
+-  adaptive_icon_foreground: assets/images/logo/logo_2.png
+-  adaptive_icon_monochrome: assets/images/logo/logo_2.png
+-  macos:
+-    generate: true
+-    image_path: assets/images/logo/logo.png
+-
+-flutter_native_splash:
+-  android_12:
+-    color: "#ffffff"
+-    color_dark: "#212121"
+-  color: "#ffffff"
+-  color_dark: "#212121"
+-  image: assets/images/logo/logo_2.png
+-  image_dark: assets/images/logo/logo_2.png
+-
+-flutter:
+-  uses-material-design: true
+-
+-  assets:
+-    - path: assets/images/
+-    - path: assets/images/logo/
+-    - path: assets/images/logo/ico/
+-      platforms: [windows]
+-    - path: assets/images/logo/desktop/
+-      platforms: [linux, macos]
+-    - path: assets/images/live/
+-    - path: assets/images/paycoins/
+-    - path: assets/shaders/
+-
+-  fonts:
+-    - family: digital_id_num
+-      fonts:
+-        - asset: assets/fonts/digital_id_num.ttf
+-    - family: custom_icon
+-      fonts:
+-        - asset: assets/fonts/custom_icon.ttf
++
++environment:
++  sdk: ">=3.13.0"
++  flutter: 3.47.7
++
++# Dependencies specify other packages that your package needs in order to work.
++# To automatically upgrade your package dependencies to the latest versions
++# consider running `flutter pub upgrade --major-versions`. Alternatively,
++# dependencies can be manually updated by changing the version numbers below to
++# the latest version available on pub.dev. To see which dependencies have newer
++# versions available, run `flutter pub outdated`.
++dependencies:
++  flutter:
++    sdk: flutter
++  flutter_localizations:
++    sdk: flutter
++
++  app_links: ^7.1.1
++  archive: ^4.0.0
++  audio_service:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/audio_service.git
++      path: audio_service
++      ref: dev
++  audio_session:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/audio_session.git
++      ref: dev
++  battery_plus: ^7.0.0
++  brotli: ^0.6.0
++  cached_network_image_ce:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_cached_network_image_ce.git
++      path: cached_network_image
++      ref: develop
++  canvas_danmaku:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/canvas_danmaku.git
++      ref: main
++  catcher_2:
++    git:
++      url: https://github.com/My-Responsitories/catcher_2.git
++      ref: dev
++  characters: ^1.4.1
++  chat_bottom_container:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_chat_packages.git
++      path: packages/chat_bottom_container
++      ref: dev
++  collection: ^1.19.1
++  connectivity_plus: ^7.1.1
++  cookie_jar: ^4.0.8
++  crypto: ^3.0.6
++  cupertino_ui: ^1.0.0
++  device_info_plus: ^13.1.0
++  dio: ^5.9.1
++  dio_http2_adapter: ^2.7.1
++  dlna_dart: ^0.1.0
++  dynamic_color: ^2.1.0
++  easy_debounce: ^2.0.3
++  encrypt: ^5.0.3
++  extended_nested_scroll_view:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/extended_nested_scroll_view.git
++      ref: dev
++  ffi: ^2.2.0
++  file_picker: ^13.1.0
++  fixnum: ^1.1.1
++  fl_chart: ^1.0.0
++  flex_seed_scheme: ^5.0.0
++  flutter_displaymode: ^0.7.0
++  flutter_html:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_html.git
++      ref: dev
++  flutter_inappwebview: ^6.1.5
++  flutter_smart_dialog:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_smart_dialog.git
++      ref: main
++  flutter_sortable_wrap:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_sortable_wrap.git
++      ref: master
++  flutter_staggered_grid_view: ^0.7.0
++  flutter_svg: ^2.0.14
++  flutter_volume_controller: ^2.0.0
++  font_awesome_flutter:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/font_awesome_flutter.git
++      ref: v10.9.0
++  get:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/getx.git
++      ref: dev
++  hive_ce: ^2.19.3
++  html: ^0.15.4
++  http2: ^2.3.1
++  image_cropper: ^12.0.0
++  image_picker: ^1.1.2
++  intl: ^0.20.2
++  jni: ^1.0.0
++  json_annotation: ^4.11.0
++  live_photo_maker: ^0.0.6
++  logger: ^2.5.0
++  material_color_utilities: ^0.13.0
++  material_design_icons_flutter:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/material_design_icons_flutter.git
++      ref: const
++  material_new_shapes: ^1.0.0
++  material_ui: ^1.0.0
++  media_kit: 1.1.11
++  media_kit_libs_video: 1.0.5
++  media_kit_video: 1.2.5
++  mime: ^2.0.0
++  nativeapi: ^0.5.2
++  native_device_orientation:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_native_device_orientation.git
++      ref: master
++  package_info_plus: ^10.1.0
++  path: ^1.9.1
++  path_provider: ^2.1.5
++  path_provider_platform_interface: ^2.1.3
++  permission_handler_android: ^14.0.0
++  permission_handler_apple: ^9.4.7
++  permission_handler_platform_interface: ^4.3.0
++  pretty_qr_code: ^3.3.0
++  protobuf: ^6.0.0
++  re_highlight: ^0.0.3
++  saver_gallery: ^5.0.2
++  screen_brightness_platform_interface: ^2.1.0
++  screen_retriever: ^0.3.0
++  share_plus: ^13.1.0
++  stream_transform: ^2.1.1
++  super_sliver_list:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/super_sliver_list.git
++      ref: mod
++  synchronized: ^3.3.0
++  tray_manager: ^0.8.0
++  url_launcher: ^6.3.1
++  uuid: ^4.5.1
++  vector_math: ^2.2.0
++  wakelock_plus: ^1.2.8
++  web_socket_channel: ^3.0.3
++  webdav_client:
++    git:
++      url: https://github.com/wgh136/webdav_client.git
++      ref: main
++  win32: ^6.3.0
++  window_manager:
++    git:
++      url: https://github.com/leanflutter/window_manager.git
++      ref: main
++
++dependency_overrides:
++  # 本地化的 canvas_danmaku：支持在弹幕里绘制表情图片（直播表情弹幕）
++  canvas_danmaku:
++    path: third_party/canvas_danmaku
++  flutter_inappwebview_android:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_inappwebview.git
++      path: flutter_inappwebview_android
++      ref: v6.1.5
++  flutter_inappwebview_windows:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/flutter_inappwebview.git
++      path: flutter_inappwebview_windows
++      ref: v6.1.5
++  media_kit:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: media_kit
++      ref: native
++  media_kit_libs_android_video:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: libs/android/media_kit_libs_android_video
++      ref: native
++  media_kit_libs_ios_video:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: libs/ios/media_kit_libs_ios_video
++      ref: native
++  media_kit_libs_video:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: libs/universal/media_kit_libs_video
++      ref: native
++  media_kit_libs_windows_video:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: libs/windows/media_kit_libs_windows_video
++      ref: native
++  media_kit_native_event_loop:
++    git:
++      url: https://github.com/My-Responsitories/media-kit.git
++      path: media_kit_native_event_loop
++      ref: native
++  media_kit_video:
++    git:
++      url: https://github.com/bggRGjQaUbCoE/media-kit.git
++      path: media_kit_video
++      ref: native
++
++dev_dependencies:
++  flutter_test:
++    sdk: flutter
++  build_runner: ^2.10.3
++  flutter_launcher_icons: ^0.14.4
++  flutter_lints: ^6.0.0
++  flutter_native_splash: ^2.4.6
++  jnigen: ^1.0.0
++
++flutter_launcher_icons:
++  android: true
++  ios: true
++  remove_alpha_ios: true
++  image_path: assets/images/logo/logo_2.png
++  image_path_android: assets/images/logo/logo_2.png
++  image_path_ios: assets/images/logo/logo.png
++  adaptive_icon_background: "#ffffff"
++  adaptive_icon_foreground: assets/images/logo/logo_2.png
++  adaptive_icon_monochrome: assets/images/logo/logo_2.png
++  macos:
++    generate: true
++    image_path: assets/images/logo/logo.png
++
++flutter_native_splash:
++  android_12:
++    color: "#ffffff"
++    color_dark: "#212121"
++  color: "#ffffff"
++  color_dark: "#212121"
++  image: assets/images/logo/logo_2.png
++  image_dark: assets/images/logo/logo_2.png
++
++flutter:
++  uses-material-design: true
++
++  assets:
++    - path: assets/images/
++    - path: assets/images/logo/
++    - path: assets/images/logo/ico/
++      platforms: [windows]
++    - path: assets/images/logo/desktop/
++      platforms: [linux, macos]
++    - path: assets/images/live/
++    - path: assets/images/paycoins/
++    - path: assets/shaders/
++
++  fonts:
++    - family: digital_id_num
++      fonts:
++        - asset: assets/fonts/digital_id_num.ttf
++    - family: custom_icon
++      fonts:
++        - asset: assets/fonts/custom_icon.ttf
+diff --git a/third_party/canvas_danmaku/.gitignore b/third_party/canvas_danmaku/.gitignore
+new file mode 100644
+index 0000000..f38fbb2
+--- /dev/null
++++ b/third_party/canvas_danmaku/.gitignore
+@@ -0,0 +1,30 @@
++# Miscellaneous
++*.class
++*.log
++*.pyc
++*.swp
++.DS_Store
++.atom/
++.buildlog/
++.history
++.svn/
++migrate_working_dir/
++
++# IntelliJ related
++*.iml
++*.ipr
++*.iws
++.idea/
++
++# The .vscode folder contains launch configuration and tasks you configure in
++# VS Code which you may wish to be included in version control, so this line
++# is commented out by default.
++#.vscode/
++
++# Flutter/Dart/Pub related
++# Libraries should not include pubspec.lock, per https://dart.dev/guides/libraries/private-files#pubspeclock.
++/pubspec.lock
++**/doc/api/
++.dart_tool/
++build/
++**/Flutter/ephemeral/
+\ No newline at end of file
+diff --git a/third_party/canvas_danmaku/.metadata b/third_party/canvas_danmaku/.metadata
+new file mode 100644
+index 0000000..d36dfbc
+--- /dev/null
++++ b/third_party/canvas_danmaku/.metadata
+@@ -0,0 +1,10 @@
++# This file tracks properties of this Flutter project.
++# Used by Flutter tool to assess capabilities and perform upgrades etc.
++#
++# This file should be version controlled and should not be manually edited.
++
++version:
++  revision: "a14f74ff3a1cbd521163c5f03d68113d50af93d3"
++  channel: "stable"
++
++project_type: package
+diff --git a/third_party/canvas_danmaku/CHANGELOG.md b/third_party/canvas_danmaku/CHANGELOG.md
+new file mode 100644
+index 0000000..e0cc84a
+--- /dev/null
++++ b/third_party/canvas_danmaku/CHANGELOG.md
+@@ -0,0 +1,78 @@
++## 0.2.6
++
++* Power Saving.
++## 0.2.5
++
++* Danmakus can be cleared even they are not running.
++## 0.2.4
++
++* Add safe area option.
++## 0.2.3
++
++* Add customize font weight support.
++## 0.2.2
++
++* Better danamku cleaner.
++## 0.2.1
++
++* Fix flick when danmaku speed was changed.
++## 0.2.0
++
++* Add rect to your own danmaku.
++## 0.1.9
++
++* Fix danmaku area option.
++## 0.1.8
++
++* When the updateOption() function is called to hide a specified type of danmaku, this type of danmaku will be cleared immediately.
++## 0.1.7
++
++* Bug fix (resume danmaku when danmaku is running leads to stopwatch error)
++## 0.1.6
++
++* Pass static analysis
++## 0.1.5
++
++* fix Layout
++## 0.1.4
++
++* add IgnorePointer
++## 0.1.3
++
++* stopResume improve
++## 0.1.2
++
++* Bug fix
++## 0.1.1
++
++* Bug fix
++## 0.1.0
++
++* Fix overflow
++## 0.0.9
++
++* Add massive mode
++## 0.0.8
++
++* Fixed problem that animation cannot continue after sleeping on android/ios platform
++## 0.0.7
++
++* Improved collision detection
++## 0.0.6
++
++* Add option for hide danmaku
++## 0.0.5
++
++* Better performance
++## 0.0.4
++
++* Add dartdoc comments
++## 0.0.3
++
++* Support topDanmaku and bottomDanmaku
++## 0.0.2
++
++* Pass static analysis
++## 0.0.1
++
++* Initial release.
+diff --git a/third_party/canvas_danmaku/LICENSE b/third_party/canvas_danmaku/LICENSE
+new file mode 100644
+index 0000000..71dce5a
+--- /dev/null
++++ b/third_party/canvas_danmaku/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2024 Predidit
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/third_party/canvas_danmaku/README.md b/third_party/canvas_danmaku/README.md
+new file mode 100644
+index 0000000..b84e974
+--- /dev/null
++++ b/third_party/canvas_danmaku/README.md
+@@ -0,0 +1,84 @@
++<!--
++This README describes the package. If you publish this package to pub.dev,
++this README's contents appear on the landing page for your package.
++
++For information about how to write a good package README, see the guide for
++[writing package pages](https://dart.dev/guides/libraries/writing-package-pages).
++
++For general information about developing packages, see the Dart guide for
++[creating packages](https://dart.dev/guides/libraries/create-library-packages)
++and the Flutter guide for
++[developing packages and plugins](https://flutter.dev/developing-packages).
++-->
++
++## 概述
++
++一个使用 `CustomPainter` 进行直接绘制的简易高性能 `flutter` 弹幕组件
++
++## 示例
++
++``` yaml
++dependencies: 
++  canvas_danmaku: ^0.2.6
++```
++
++Example:
++
++```dart
++
++import 'package:canvas_danmaku/canvas_danmaku.dart';
++
++class _DanmakuPageState extends State<DanmakuPage> {
++    late DanmakuController _controller;
++    @override
++    Widget build(BuildContext context) {
++        return Stack(
++        children: [
++            // 你的自定义组件，例如一个播放器
++            Container(),
++            // 弹幕组件
++            DanmakuScreen(
++            createdController: (e) {
++                _controller = e;
++            },
++            option: DanmakuOption(),
++            ),
++        ],
++        );
++    }
++}
++
++```
++
++## 说明
++
++本项目接口设计参考 `ns_danmaku` ，支持 `ns_danmaku` 的大部分功能。本项目与其的区别在于弹幕绘制原理。
++
++## 特性
++
++#### 高性能
++
++`canvas_danmaku` 通过底层的 `CustomPainter` 直接绘制弹幕。这可以减少 Flutter 框架中组件的数量，降低了组件树的复杂度，从而提高性能。
++
++`canvas_danmaku` 特别优化了过度重绘问题。滚动弹幕与静止弹幕分层处理，静止弹幕仅在需要时重绘。此外，当没有弹幕时，`canvas_danmaku` 会优雅地暂停所有绘制，并在重新出现弹幕时优雅地重新开始绘制。
++
++`canvas_danmaku` 渲染准备与渲染操作异步。渲染准备在弹幕添加时进行并缓存，每帧直接使用缓存而无需渲染准备。渲染缓存只在弹幕添加时生成，或在弹幕属性变动时(例如更改字体)重新生成。
++
++#### 简单
++
++`canvas_danmaku` 不依赖于上下文，不需要传递 `BuildContext`。
++
++`canvas_danmaku` 也不需要传递 弹幕容器高度/弹幕轨道数 等控制弹幕布局的信息。
++
++`canvas_danmaku` 是响应式的，弹幕容器高度会根据父组件自适应，弹幕轨道数根据当前容器高度与字体大小动态计算。
++
++`canvas_danmaku` 弹幕容器属性(字体大小/字体透明度等)可在容器运行时热更新，渲染缓存将会在发生热更新时优雅地销毁并重新生成。
++
++~~## 局限~~
++
++~~如前文所述，本项目绘制的弹幕本质是一段动画，而非一组小组件。故本项目绘制的弹幕不具有交互性，如果您需要点击弹幕来实现的交互操作，本项目并不能满足需求。~~
++
++## 致谢
++
++[xiaoyaocz/ns_danmaku](https://github.com/xiaoyaocz/flutter_ns_danmaku) 本项目的灵感来自 ns_danmaku ，一个非常优秀的项目。
++
+diff --git a/third_party/canvas_danmaku/analysis_options.yaml b/third_party/canvas_danmaku/analysis_options.yaml
+new file mode 100644
+index 0000000..0e19109
+--- /dev/null
++++ b/third_party/canvas_danmaku/analysis_options.yaml
+@@ -0,0 +1,62 @@
++# This file configures the analyzer, which statically analyzes Dart code to
++# check for errors, warnings, and lints.
++#
++# The issues identified by the analyzer are surfaced in the UI of Dart-enabled
++# IDEs (https://dart.dev/tools#ides-and-editors). The analyzer can also be
++# invoked from the command line by running `flutter analyze`.
++
++# The following line activates a set of recommended lints for Flutter apps,
++# packages, and plugins designed to encourage good coding practices.
++include: package:flutter_lints/flutter.yaml
++
++formatter:
++  trailing_commas: preserve
++
++linter:
++  # The lint rules applied to this project can be customized in the
++  # section below to disable rules from the `package:flutter_lints/flutter.yaml`
++  # included above or to enable additional rules. A list of all available lints
++  # and their documentation is published at
++  # https://dart-lang.github.io/linter/lints/index.html.
++  #
++  # Instead of disabling a lint rule for the entire project in the
++  # section below, it can also be suppressed for a single line of code
++  # or a specific dart file by using the `// ignore: name_of_lint` and
++  # `// ignore_for_file: name_of_lint` syntax on the line or in the file
++  # producing the lint.
++  # https://dart.dev/tools/linter-rules
++  rules:
++    # avoid_print: false  # Uncomment to disable the `avoid_print` rule
++    # prefer_single_quotes: true  # Uncomment to enable the `prefer_single_quotes` rule
++    # - always_specify_types
++    # - avoid_positional_boolean_parameters
++    - always_declare_return_types
++    - always_use_package_imports
++    - avoid_empty_else
++    - avoid_field_initializers_in_const_classes
++    - avoid_print
++    - avoid_relative_lib_imports
++    - avoid_shadowing_type_parameters
++    - avoid_single_cascade_in_expression_statements
++    - avoid_slow_async_io
++    - avoid_type_to_string
++    - avoid_types_as_parameter_names
++    - avoid_unnecessary_containers
++    - avoid_void_async
++    - await_only_futures
++    - camel_case_extensions
++    - camel_case_types
++    - cancel_subscriptions
++    - cascade_invocations
++    - prefer_const_constructors
++    - prefer_const_declarations
++    - sized_box_for_whitespace
++    - unnecessary_late
++    - use_colored_box
++    - use_decorated_box
++    - use_named_constants
++    - use_null_aware_elements
++    - unnecessary_lambdas
++    - use_is_even_rather_than_modulo
++# Additional information about this file can be found at
++# https://dart.dev/guides/language/analysis-options
+diff --git a/third_party/canvas_danmaku/lib/base_danmaku_painter.dart b/third_party/canvas_danmaku/lib/base_danmaku_painter.dart
+new file mode 100644
+index 0000000..05b5d50
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/base_danmaku_painter.dart
+@@ -0,0 +1,50 @@
++import 'package:canvas_danmaku/canvas_danmaku.dart';
++import 'package:material_ui/material_ui.dart';
++
++abstract base class BaseDanmakuPainter extends CustomPainter {
++  final int length;
++  final double fontSize;
++  final int fontWeight;
++  final double strokeWidth;
++  final bool running;
++  final int batchThreshold;
++  final int tick;
++
++  static final Paint _paint = Paint();
++
++  const BaseDanmakuPainter({
++    required this.length,
++    required this.fontSize,
++    required this.fontWeight,
++    required this.strokeWidth,
++    required this.running,
++    required this.tick,
++    this.batchThreshold = 10, // 默认值为10，可以自行调整
++  });
++
++  static void paintImg(
++    Canvas canvas,
++    DanmakuItem item,
++    double dx,
++    double dy,
++  ) {
++    final img = item.image!;
++    if (img.width == item.width.ceil()) {
++      canvas.drawImage(img, Offset(dx, dy), _paint);
++    } else {
++      final src =
++          Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble());
++      final dst = Rect.fromLTWH(dx, dy, item.width, item.height);
++      canvas.drawImageRect(img, src, dst, _paint);
++    }
++  }
++
++  @override
++  bool shouldRepaint(covariant BaseDanmakuPainter oldDelegate) {
++    return (running && length != 0) ||
++        oldDelegate.length != length ||
++        oldDelegate.fontSize != fontSize ||
++        oldDelegate.fontWeight != fontWeight ||
++        oldDelegate.strokeWidth != strokeWidth;
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/canvas_danmaku.dart b/third_party/canvas_danmaku/lib/canvas_danmaku.dart
+new file mode 100644
+index 0000000..4cddbac
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/canvas_danmaku.dart
+@@ -0,0 +1,5 @@
++export 'danmaku_controller.dart';
++export 'danmaku_screen.dart';
++export 'models/danmaku_content_item.dart';
++export 'models/danmaku_item.dart';
++export 'models/danmaku_option.dart';
+diff --git a/third_party/canvas_danmaku/lib/danmaku_controller.dart b/third_party/canvas_danmaku/lib/danmaku_controller.dart
+new file mode 100644
+index 0000000..b813f61
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/danmaku_controller.dart
+@@ -0,0 +1,43 @@
++import 'package:canvas_danmaku/models/danmaku_content_item.dart';
++import 'package:canvas_danmaku/models/danmaku_item.dart';
++import 'package:canvas_danmaku/models/danmaku_option.dart';
++import 'package:material_ui/material_ui.dart';
++
++class DanmakuController<T> {
++  final bool Function(DanmakuContentItem<T>) addDanmaku;
++  final ValueChanged<DanmakuOption> updateOption;
++  final VoidCallback pause;
++  final VoidCallback resume;
++  final VoidCallback clear;
++  final ValueGetter<DanmakuOption> getOption;
++  final ValueGetter<bool> isRunning;
++  final Iterable<(double, DanmakuItem<T>)> Function(Offset) findDanmaku;
++  final (double, DanmakuItem<T>)? Function(Offset) findSingleDanmaku;
++  final ValueGetter<int> getTrackCount;
++
++  final List<List<DanmakuItem<T>>> scrollDanmaku;
++  final List<DanmakuItem<T>?> staticDanmaku;
++  final List<DanmakuItem<T>> specialDanmaku;
++
++  DanmakuOption get option => getOption();
++
++  bool get running => isRunning();
++
++  int get trackCount => getTrackCount();
++
++  DanmakuController({
++    required this.addDanmaku,
++    required this.updateOption,
++    required this.pause,
++    required this.resume,
++    required this.clear,
++    required this.getOption,
++    required this.isRunning,
++    required this.findDanmaku,
++    required this.findSingleDanmaku,
++    required this.getTrackCount,
++    required this.scrollDanmaku,
++    required this.staticDanmaku,
++    required this.specialDanmaku,
++  });
++}
+diff --git a/third_party/canvas_danmaku/lib/danmaku_screen.dart b/third_party/canvas_danmaku/lib/danmaku_screen.dart
+new file mode 100644
+index 0000000..2232b5e
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/danmaku_screen.dart
+@@ -0,0 +1,705 @@
++import 'dart:math';
++
++import 'package:canvas_danmaku/danmaku_controller.dart';
++import 'package:canvas_danmaku/models/danmaku_content_item.dart';
++import 'package:canvas_danmaku/models/danmaku_item.dart';
++import 'package:canvas_danmaku/models/danmaku_option.dart';
++import 'package:canvas_danmaku/scroll_danmaku_painter.dart';
++import 'package:canvas_danmaku/special_danmaku_painter.dart';
++import 'package:canvas_danmaku/static_danmaku_painter.dart';
++import 'package:canvas_danmaku/utils/utils.dart';
++import 'package:flutter/scheduler.dart';
++import 'package:material_ui/material_ui.dart';
++
++class DanmakuScreen<T> extends StatefulWidget {
++  // 创建Screen后返回控制器
++  final ValueChanged<DanmakuController<T>> createdController;
++  final DanmakuOption option;
++  final Size size;
++
++  const DanmakuScreen({
++    super.key,
++    required this.createdController,
++    required this.option,
++    required this.size,
++  });
++
++  @override
++  State<DanmakuScreen<T>> createState() => _DanmakuScreenState<T>();
++}
++
++class _DanmakuScreenState<T> extends State<DanmakuScreen<T>>
++    with SingleTickerProviderStateMixin {
++  /// 视图宽度
++  double _viewWidth = 0;
++  double _viewHeight = 0;
++  double devicePixelRatio = 1;
++
++  /// 弹幕配置
++  late DanmakuOption _option;
++
++  /// 滚动弹幕
++  final _scrollDanmakuItems = <List<DanmakuItem<T>>>[];
++
++  /// 静态弹幕
++  final _staticDanmakuItems = ListValueNotifier(<DanmakuItem<T>?>[]);
++
++  /// 高级弹幕
++  final _specialDanmakuItems = <DanmakuItem<T>>[];
++
++  bool get _isEmpty =>
++      _scrollDanmakuItems.every((list) => list.isEmpty) &&
++      _staticDanmakuItems.value.nonNulls.isEmpty &&
++      _specialDanmakuItems.isEmpty;
++
++  /// 弹幕高度
++  double _danmakuHeight = 0;
++
++  /// 弹幕轨道数
++  int _trackCount = 0;
++
++  /// 滚动弹幕速度或时间，负号表示速度
++  double _scrollVelocityOrDuration = 0;
++
++  late final _random = Random();
++
++  late final Ticker _ticker;
++  late final ValueNotifier<int> _notifier;
++  late int _lastTick = 0;
++
++  /// 运行状态
++  bool _running = true;
++
++  @override
++  void initState() {
++    super.initState();
++    _option = widget.option;
++    if (!_option.scrollFixedVelocity) {
++      _scrollVelocityOrDuration = _option.durationInMilliseconds;
++    }
++    DmUtils.updateSelfSendPaint(_option.strokeWidth);
++
++    _danmakuHeight = _textPainter.height;
++
++    _ticker = createTicker(_tick);
++    _notifier = ValueNotifier(0);
++
++    widget.createdController(DanmakuController<T>(
++      addDanmaku: _addDanmaku,
++      updateOption: _updateOption,
++      pause: _pause,
++      resume: _resume,
++      clear: _clear,
++      getOption: () => _option,
++      isRunning: () => _running,
++      findDanmaku: findDanmaku,
++      findSingleDanmaku: findSingleDanmaku,
++      getTrackCount: () => _trackCount,
++      scrollDanmaku: _scrollDanmakuItems,
++      staticDanmaku: _staticDanmakuItems.value,
++      specialDanmaku: _specialDanmakuItems,
++    ));
++
++    _init(widget.size);
++  }
++
++  @override
++  void didChangeDependencies() {
++    super.didChangeDependencies();
++    DmUtils.fontFamily = DefaultTextStyle.of(context).style.fontFamily;
++
++    final devicePixelRatio = MediaQuery.devicePixelRatioOf(context);
++    DmUtils.devicePixelRatio = devicePixelRatio;
++    if (devicePixelRatio > this.devicePixelRatio) {
++      for (var i in _scrollDanmakuItems) {
++        for (var e in i) {
++          e.dispose();
++        }
++      }
++      for (var e in _staticDanmakuItems.value) {
++        e?.dispose();
++      }
++      for (var item in _specialDanmakuItems) {
++        item.dispose();
++      }
++      this.devicePixelRatio = devicePixelRatio;
++    }
++  }
++
++  int _time = 0;
++  void _tick(Duration elapsed) {
++    _notifier.value = elapsed.inMilliseconds + _lastTick;
++    if (_time++ > 10) {
++      _time = 0;
++      _lazyTick(_notifier.value);
++    }
++  }
++
++  TextPainter get _textPainter => TextPainter(
++        text: TextSpan(
++          text: '弹幕',
++          style: TextStyle(
++            fontSize: _option.fontSize,
++            height: _option.lineHeight,
++          ),
++        ),
++        textDirection: TextDirection.ltr,
++      )..layout();
++
++  @override
++  void dispose() {
++    _running = false;
++    _ticker.dispose();
++    _clearDanmakus();
++    _notifier.dispose();
++    _staticDanmakuItems.dispose();
++    super.dispose();
++  }
++
++  bool _handleNormalDanmaku(
++    DanmakuContentItem<T> content,
++    bool Function(int, double) canAdd, {
++    bool scroll = false,
++  }) {
++    bool added = false;
++
++    final paragraph = DmUtils.generateParagraph(
++      content: content,
++      fontSize: _option.fontSize,
++      fontWeight: _option.fontWeight,
++    );
++
++    final danmakuWidth = (content.selfSend
++            ? paragraph.maxIntrinsicWidth + 4
++            : paragraph.maxIntrinsicWidth) +
++        _option.strokeWidth;
++    final danmakuHeight = paragraph.height + _option.strokeWidth;
++
++    if (!scroll &&
++        content.type != DanmakuItemType.scroll &&
++        _option.static2Scroll &&
++        danmakuWidth > _viewWidth) {
++      return false;
++    }
++
++    DanmakuItem<T> getItem() => DanmakuItem<T>(
++        xPosition: _viewWidth,
++        width: danmakuWidth,
++        height: danmakuHeight,
++        content: content,
++        image: DmUtils.recordDanmakuImage(
++          contentParagraph: paragraph,
++          content: content,
++          fontSize: _option.fontSize,
++          fontWeight: _option.fontWeight,
++          strokeWidth: _option.strokeWidth,
++        ));
++
++    for (var i = 0; i < _trackCount; i++) {
++      final index =
++          content.type == DanmakuItemType.bottom ? _trackCount - 1 - i : i;
++
++      if (added = canAdd(index, danmakuWidth)) {
++        final item = getItem();
++        if (content.type == DanmakuItemType.scroll || scroll) {
++          _scrollDanmakuItems[index].add(item);
++        } else {
++          _staticDanmakuItems.value[index] = item;
++          if (_running) {
++            _staticDanmakuItems.refresh();
++          }
++        }
++        break;
++      }
++    }
++
++    if (added) {
++      if (_running && !_ticker.isActive) {
++        _ticker.start();
++      }
++    } else {
++      if (content.selfSend) {
++        _scrollDanmakuItems[0].add(getItem());
++        added = true;
++      } else if ((content.type == DanmakuItemType.scroll || scroll) &&
++          _option.massiveMode) {
++        _scrollDanmakuItems[_random.nextInt(_trackCount)].add(getItem());
++        added = true;
++      }
++    }
++
++    paragraph.dispose();
++    return added;
++  }
++
++  /// 添加弹幕
++  bool _addDanmaku(DanmakuContentItem<T> content) {
++    if (!mounted) {
++      return false;
++    }
++
++    bool added;
++    switch (content.type) {
++      case DanmakuItemType.scroll:
++        if (_option.hideScroll) return false;
++        added = _handleNormalDanmaku(content, _scrollCanAddToTrack);
++        break;
++      case DanmakuItemType.top:
++      case DanmakuItemType.bottom:
++        if (_option.hideWhat(content.type)) return false;
++        added = _handleNormalDanmaku(content, _staticCanAddToTrack);
++        if (!added && _option.static2Scroll && !_option.hideScroll) {
++          added =
++              _handleNormalDanmaku(content, _scrollCanAddToTrack, scroll: true);
++        }
++        break;
++      case DanmakuItemType.special:
++        if (_option.hideSpecial) return false;
++        added = true;
++        _specialDanmakuItems.add(
++          DanmakuItem<T>(
++              width: 0,
++              height: 0,
++              content: content,
++              image: DmUtils.recordSpecialDanmakuImg(
++                content: content as SpecialDanmakuContentItem,
++                fontWeight: _option.fontWeight,
++                strokeWidth: _option.strokeWidth,
++              )),
++        );
++        if (_running && !_ticker.isActive) {
++          _ticker.start();
++        }
++        break;
++    }
++    return added;
++  }
++
++  /// 暂停
++  void _pause() {
++    if (!mounted) return;
++    _running = false;
++    if (_ticker.isActive) {
++      _lastTick = _notifier.value;
++      _ticker.stop();
++    }
++  }
++
++  /// 恢复
++  void _resume() {
++    if (!mounted) return;
++    _running = true;
++    if (!_isEmpty && !_ticker.isActive) {
++      _ticker.start();
++    }
++    _staticDanmakuItems.refresh();
++  }
++
++  /// 清空弹幕
++  void _clear() {
++    if (!mounted) return;
++    _clearDanmakus();
++    if (_ticker.isActive) {
++      // SchedulerBinding.instance.addPostFrameCallback(
++      //   (_) => _ticker.stop(),
++      // );
++    } else {
++      _notifier.refresh();
++    }
++  }
++
++  /// 更新弹幕设置
++  void _updateOption(DanmakuOption option) {
++    if (option.durationInMilliseconds != _option.durationInMilliseconds ||
++        option.scrollFixedVelocity != _option.scrollFixedVelocity) {
++      _scrollVelocityOrDuration = option.scrollFixedVelocity
++          ? -_viewWidth / option.durationInMilliseconds
++          : option.durationInMilliseconds;
++    }
++
++    final lineHeightChanged = option.lineHeight != _option.lineHeight;
++    if (lineHeightChanged) {
++      _option = option;
++      _danmakuHeight = _textPainter.height;
++      _calcTracks();
++      return;
++    }
++
++    final fontSizeChanged = option.fontSize != _option.fontSize;
++
++    final clearScroll = option.hideScroll && !_option.hideScroll;
++
++    final clearParagraph = fontSizeChanged ||
++        option.fontWeight != _option.fontWeight ||
++        option.strokeWidth != _option.strokeWidth;
++
++    final needRestart = _ticker.isActive && clearScroll && clearParagraph;
++    if (needRestart) {
++      _lastTick = _notifier.value;
++      _ticker.stop();
++    }
++
++    /// 需要隐藏弹幕时清理已有弹幕
++    if (clearScroll) {
++      for (var i in _scrollDanmakuItems) {
++        for (var e in i) {
++          e.dispose();
++        }
++        i.clear();
++      }
++    }
++
++    final clearTop = option.hideTop && !_option.hideTop;
++    final clearBottom = option.hideBottom && !_option.hideBottom;
++    if (clearTop || clearBottom) {
++      _staticDanmakuItems.removeWhere((e) => e.needRemove(
++            (clearTop && e.content.type == DanmakuItemType.top) ||
++                (clearBottom && e.content.type == DanmakuItemType.bottom),
++          ));
++    }
++    if (option.hideSpecial && !_option.hideSpecial) {
++      for (var e in _specialDanmakuItems) {
++        e.dispose();
++      }
++      _specialDanmakuItems.clear();
++    }
++
++    /// 清理已经存在的 Paragraph 缓存
++    if (clearParagraph) {
++      DmUtils.updateSelfSendPaint(_option.strokeWidth);
++      for (var i in _scrollDanmakuItems) {
++        for (var e in i) {
++          e.dispose();
++        }
++      }
++      for (var e in _staticDanmakuItems.value) {
++        e?.dispose();
++      }
++      for (var item in _specialDanmakuItems) {
++        item.dispose();
++      }
++    }
++
++    final areaChanged = option.area != _option.area;
++    final safeAreaChanged = option.safeArea != _option.safeArea;
++    _option = option;
++    if (fontSizeChanged) {
++      _danmakuHeight = _textPainter.height;
++    }
++    if (fontSizeChanged || areaChanged || safeAreaChanged) {
++      _calcTracks();
++    }
++
++    if (needRestart) {
++      _ticker.start();
++    } else {
++      _notifier.refresh();
++      _staticDanmakuItems.refresh();
++    }
++  }
++
++  void _clearDanmakus() {
++    for (var i in _scrollDanmakuItems) {
++      for (var e in i) {
++        e.dispose();
++      }
++      i.clear();
++    }
++    for (int i = 0; i < _trackCount; i++) {
++      final item = _staticDanmakuItems[i];
++      if (item != null) {
++        item.dispose();
++        _staticDanmakuItems[i] = null;
++      }
++    }
++    _staticDanmakuItems.refresh();
++    for (var e in _specialDanmakuItems) {
++      e.dispose();
++    }
++    _specialDanmakuItems.clear();
++  }
++
++  /// 确定滚动弹幕是否可以添加
++  bool _scrollCanAddToTrack(int index, double newDanmakuWidth) {
++    final item = _scrollDanmakuItems[index].lastOrNull;
++    if (item == null) return true;
++    // 首先保证进入屏幕时不发生重叠
++    final right = item.xPosition + item.width;
++    if (_viewWidth < right) {
++      return false;
++    }
++    // 其次保证知道移出屏幕前不与速度慢的弹幕(弹幕宽度较小)发生重叠
++    if (!_option.scrollFixedVelocity && item.width < newDanmakuWidth) {
++      // (1 - ((_viewWidth - item.xPosition) / (item.width + _viewWidth))) > ((_viewWidth) / (_viewWidth + newDanmakuWidth))
++      if (right * newDanmakuWidth >
++          _viewWidth * (_viewWidth - item.xPosition)) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  /// 确定静态弹幕是否可以添加
++  bool _staticCanAddToTrack(int index, double _) {
++    return _staticDanmakuItems[index] == null;
++  }
++
++  @pragma("vm:prefer-inline")
++  void _lazyTick(int tick) {
++    // 移除屏幕外滚动弹幕
++    for (var i in _scrollDanmakuItems) {
++      i.removeWhereUnsafe((item) => item.needRemove(item.expired ||
++          // `paint()` is skipped when `opacity` is `0`, `expired` is always `false`
++          (!item.suspend &&
++              item.drawTick != null &&
++              (tick - item.drawTick!) >= _option.durationInMilliseconds)));
++    }
++    // 移除静态弹幕
++    _staticDanmakuItems.removeWhere((item) => item.needRemove(!item.suspend &&
++        item.drawTick != null &&
++        (tick - item.drawTick!) >= _option.staticDurationInMilliseconds));
++    // 移除高级弹幕
++    _specialDanmakuItems.removeWhereUnsafe((item) => item.needRemove(
++        item.expired ||
++            (item.drawTick != null &&
++                (tick - item.drawTick!) >=
++                    (item.content as SpecialDanmakuContentItem).duration)));
++    // 暂停动画
++    if (_isEmpty && _ticker.isActive) {
++      _lastTick = tick;
++      _ticker.stop();
++    }
++  }
++
++  void _calcTracks() {
++    final area = _viewHeight * _option.area;
++    int newTrackCount = area ~/ _danmakuHeight;
++
++    /// 为字幕留出余量
++    if (_option.safeArea && _option.area == 1.0) {
++      newTrackCount--;
++    }
++    if (newTrackCount != _trackCount) {
++      // 丢弃超出屏幕范围的弹幕
++      _staticDanmakuItems.value.length = newTrackCount;
++      _scrollDanmakuItems.changeLength(newTrackCount);
++      _trackCount = newTrackCount;
++    }
++  }
++
++  @override
++  void didUpdateWidget(DanmakuScreen<T> oldWidget) {
++    super.didUpdateWidget(oldWidget);
++    if (oldWidget.size != widget.size) {
++      _init(widget.size);
++    }
++  }
++
++  void _init(Size size) {
++    final viewWidth = size.width;
++    final viewHeight = size.height;
++    if (_viewWidth != viewWidth) {
++      _viewWidth = viewWidth;
++      if (_option.scrollFixedVelocity) {
++        _scrollVelocityOrDuration =
++            -_viewWidth / _option.durationInMilliseconds;
++      }
++    }
++    if (_viewHeight != viewHeight) {
++      _viewHeight = viewHeight;
++      _calcTracks();
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return IgnorePointer(
++      child: Stack(
++        children: [
++          RepaintBoundary.wrap(
++            ValueListenableBuilder(
++              valueListenable: _notifier,
++              builder: (context, value, child) {
++                return CustomPaint(
++                  willChange: _running,
++                  painter: ScrollDanmakuPainter(
++                    length: _scrollDanmakuItems.fold<int>(
++                        0, (p, n) => p + n.length),
++                    trackHeight: _danmakuHeight,
++                    danmakuItems: _scrollDanmakuItems,
++                    durationInMilliseconds: _scrollVelocityOrDuration,
++                    fontSize: _option.fontSize,
++                    fontWeight: _option.fontWeight,
++                    strokeWidth: _option.strokeWidth,
++                    running: _running,
++                    tick: value,
++                  ),
++                  size: widget.size,
++                );
++              },
++            ),
++            0,
++          ),
++          RepaintBoundary.wrap(
++            ValueListenableBuilder(
++              valueListenable: _staticDanmakuItems,
++              builder: (context, value, child) {
++                return CustomPaint(
++                  painter: StaticDanmakuPainter(
++                    count: value.nonNulls.length,
++                    trackHeight: _danmakuHeight,
++                    danmakuItems: value,
++                    staticDurationInMilliseconds:
++                        _option.staticDurationInMilliseconds,
++                    fontSize: _option.fontSize,
++                    fontWeight: _option.fontWeight,
++                    strokeWidth: _option.strokeWidth,
++                    tick: _notifier.value,
++                  ),
++                  size: widget.size,
++                );
++              },
++            ),
++            1,
++          ),
++          RepaintBoundary.wrap(
++            ValueListenableBuilder(
++              valueListenable: _notifier, // 与滚动弹幕共用控制器
++              builder: (context, value, child) {
++                return CustomPaint(
++                  willChange: _running,
++                  painter: SpecialDanmakuPainter(
++                    length: _specialDanmakuItems.length,
++                    danmakuItems: _specialDanmakuItems,
++                    fontSize: _option.fontSize,
++                    fontWeight: _option.fontWeight,
++                    strokeWidth: _option.strokeWidth,
++                    running: _running,
++                    tick: value,
++                  ),
++                  size: widget.size,
++                );
++              },
++            ),
++            2,
++          ),
++        ],
++      ),
++    );
++  }
++
++  Iterable<(double, DanmakuItem<T>)> findDanmaku(Offset position) sync* {
++    final index = position.dy ~/ _danmakuHeight;
++
++    if (index >= _trackCount) {
++      return;
++    }
++
++    late final trackHeight = index * _danmakuHeight;
++
++    final dx = position.dx;
++    final item = _staticDanmakuItems[index];
++    if (item != null &&
++        item.xPosition <= dx &&
++        dx <= item.xPosition + item.width) {
++      yield (trackHeight, item);
++    }
++
++    for (var i in _scrollDanmakuItems[index].reversed) {
++      if (i.xPosition <= dx && dx <= i.xPosition + i.width) {
++        yield (trackHeight, i);
++      }
++    }
++  }
++
++  (double, DanmakuItem<T>)? findSingleDanmaku(Offset position) {
++    final index = position.dy ~/ _danmakuHeight;
++
++    if (index >= _trackCount) {
++      return null;
++    }
++
++    late final trackHeight = index * _danmakuHeight;
++
++    final dx = position.dx;
++    final item = _staticDanmakuItems[index];
++    if (item != null &&
++        item.xPosition <= dx &&
++        dx <= item.xPosition + item.width) {
++      return (trackHeight, item);
++    }
++
++    for (var i in _scrollDanmakuItems[index].reversed) {
++      if (i.xPosition <= dx && dx <= i.xPosition + i.width) {
++        return (trackHeight, i);
++      }
++    }
++    return null;
++  }
++}
++
++typedef ListValueNotifier<T extends Object> = ValueNotifier<List<T?>>;
++
++extension<T extends Object> on ListValueNotifier<T> {
++  @pragma("vm:prefer-inline")
++  T? operator [](int index) {
++    return value[index];
++  }
++
++  @pragma("vm:prefer-inline")
++  void operator []=(int index, T? item) {
++    value[index] = item;
++  }
++
++  void removeWhere(bool Function(T element) test) {
++    bool remove = false;
++    for (int i = 0; i < value.length; i++) {
++      final item = value[i];
++      if (item != null && test(item)) {
++        value[i] = null;
++        remove = true;
++      }
++    }
++    if (remove) {
++      refresh();
++    }
++  }
++}
++
++extension ValueNotifierExt<T> on ValueNotifier<T> {
++  @pragma("vm:prefer-inline")
++  void refresh() {
++    // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
++    notifyListeners();
++  }
++}
++
++extension<E> on List<E> {
++  bool removeWhereUnsafe(bool Function(E) test) {
++    int write = 0;
++    final length = this.length;
++    for (int read = 0; read < length; read++) {
++      final element = this[read];
++      if (!test(element)) {
++        if (write < read) this[write] = element;
++        write++;
++      }
++    }
++    if (length != write) {
++      this.length = write;
++      return true;
++    }
++    return false;
++  }
++}
++
++extension<T> on List<List<T>> {
++  @pragma("vm:prefer-inline")
++  void changeLength(int length) {
++    if (length > this.length) {
++      addAll(Iterable.generate(length - this.length, (_) => <T>[]));
++    } else {
++      this.length = length;
++    }
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/models/danmaku_content_item.dart b/third_party/canvas_danmaku/lib/models/danmaku_content_item.dart
+new file mode 100644
+index 0000000..ad2f6c2
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/models/danmaku_content_item.dart
+@@ -0,0 +1,233 @@
++import 'dart:math' show pi;
++
++import 'package:flutter/foundation.dart' show objectRuntimeType;
++import 'package:material_ui/material_ui.dart';
++
++enum DanmakuItemType { scroll, top, bottom, special }
++
++/// 弹幕里的表情图片（直播表情/大表情）
++///
++/// [text] 是它在弹幕文本里的占位串（如 `[2233娘]`），图片还没加载好时用它兜底显示。
++class DanmakuEmote {
++  final String url;
++  final double width;
++  final double height;
++  final String text;
++
++  const DanmakuEmote({
++    required this.url,
++    this.width = 0,
++    this.height = 0,
++    this.text = '',
++  });
++
++  @override
++  String toString() => 'DanmakuEmote(text="$text", url=$url, '
++      '${width}x$height)';
++}
++
++class DanmakuContentItem<T> {
++  /// 弹幕文本
++  final String text;
++
++  /// 弹幕颜色
++  Color color;
++
++  /// 弹幕类型
++  final DanmakuItemType type;
++
++  /// 是否为自己发送
++  final bool selfSend;
++
++  /// 是否为会员弹幕
++  final bool isColorful;
++
++  /// 弹幕数量
++  final int? count;
++
++  final T? extra;
++
++  /// 文本里内嵌的表情：key 为 [text] 中出现的占位串
++  final Map<String, DanmakuEmote>? emotes;
++
++  DanmakuContentItem(
++    this.text, {
++    this.color = Colors.white,
++    this.type = DanmakuItemType.scroll,
++    this.selfSend = false,
++    this.isColorful = false,
++    this.count,
++    this.extra,
++    this.emotes,
++  });
++
++  @override
++  String toString() {
++    return '${objectRuntimeType(this, "DanmakuContentItem<?>")}(text="$text", color=0x${color.toARGB32().toRadixString(16)}, type=${type.name}${count != null ? ", count=$count" : ""}${selfSend ? ", selfSend" : ""}${isColorful ? ", colorful" : ""}${extra != null ? ". extra=$extra" : ""})';
++  }
++}
++
++class SpecialDanmakuContentItem<T> extends DanmakuContentItem<T> {
++  final int duration;
++
++  final double fontSize; // 从弹幕内容外解析
++  final bool hasStroke;
++  final Tween<double>? alphaTween;
++
++  final Tween<double> translateXTween; // 相对坐标
++  final Tween<double> translateYTween; // 相对坐标
++  final int translationDuration;
++  final int translationStartDelay;
++
++  final double rotateZ;
++  final Matrix4? matrix;
++  // final PathMetric? motionPathMetric;
++
++  final Curve easingType;
++
++  @override
++  bool get isColorful => false;
++  @override
++  bool get selfSend => false;
++  @override
++  DanmakuItemType get type => DanmakuItemType.special;
++
++  late Rect rect;
++
++  SpecialDanmakuContentItem(
++    super.text, {
++    required this.duration,
++    required super.color,
++    required this.fontSize,
++    this.hasStroke = false,
++    required this.translateXTween,
++    required this.translateYTween,
++    this.alphaTween,
++    this.rotateZ = 0,
++    this.matrix,
++    // this.motionPathMetric,
++    int? translationDuration,
++    this.translationStartDelay = 0,
++    super.count,
++    this.easingType = Curves.linear,
++    super.extra,
++  }) : translationDuration = translationDuration ?? duration;
++
++  factory SpecialDanmakuContentItem.fromList(
++    Color color,
++    double fontSize,
++    List list, {
++    double videoX = 1920,
++    double videoY = 1080,
++    bool disableGradient = false,
++    T? extra,
++  }) {
++    final (startX, endX) = _toRelativePosition(list[0], list[7], videoX);
++    final (startY, endY) = _toRelativePosition(list[1], list[8], videoY);
++    final alphaString = (list[2] as String).split('-');
++    final startA = double.tryParse(alphaString[0]) ?? 1;
++    final endA = double.tryParse(alphaString[1]) ?? 1;
++    Tween<double>? alphaTween;
++    if (disableGradient || startA == endA) {
++      color = color.withValues(alpha: (startA + endA) / 2);
++    } else {
++      color = color.withValues(alpha: startA);
++      alphaTween = Tween(begin: startA, end: endA);
++    }
++    final duration = (_parseDouble(list[3]) * 1000).round();
++    final text = (list[4] as String).trimRight();
++    double rotateZ = _degreeToRadian(_parseInt(list[5]));
++    final rotateY = _parseInt(list[6]);
++    Matrix4? matrix;
++    if (rotateY != 0) {
++      matrix = Matrix4.identity();
++      if (rotateZ != 0) {
++        matrix.rotateZ(rotateZ);
++        rotateZ = 0;
++      }
++      matrix.rotateY(_degreeToRadian(rotateY));
++    }
++    var translateXTween = _makeTween(startX, endX);
++    var translateYTween = _makeTween(startY, endY);
++    final translationDuration = _parseInt(list[9]);
++    final translationStartDelay = _parseInt(list[10]);
++    final hasStroke = list[11] == 1;
++    // 字体
++    // list[12];
++    final easingType = list[13] == 1 ? Curves.easeInCubic : Curves.linear;
++    // TODO 路径动画
++    // List<Path> path;
++    // if (list.length > 15) {
++    //   list[14];
++    // }
++    return SpecialDanmakuContentItem(
++      text,
++      duration: duration,
++      color: color,
++      fontSize: fontSize,
++      hasStroke: hasStroke,
++      alphaTween: alphaTween,
++      translateXTween: translateXTween,
++      translateYTween: translateYTween,
++      translationDuration: translationDuration,
++      translationStartDelay: translationStartDelay,
++      rotateZ: rotateZ,
++      matrix: matrix,
++      // motionPathMetric: null,
++      easingType: easingType,
++      extra: extra,
++    );
++  }
++
++  static (double, double) _toRelativePosition(
++    dynamic rawStart,
++    dynamic rawEnd,
++    double videoSize,
++  ) {
++    double toRadix(double? value, dynamic rawValue) =>
++        (value! > 1 || (rawValue is String && !rawValue.contains('.')))
++            ? value /= videoSize
++            : value;
++
++    double? convert(dynamic digit) => switch (digit) {
++          int() => digit.toDouble(),
++          double() => digit.isFinite ? digit : null,
++          String() => double.tryParse(digit),
++          _ => null
++        };
++
++    double? start = convert(rawStart);
++    double? end = convert(rawEnd);
++
++    if (start == null && end == null) return const (0, 0);
++    start ??= end;
++    end ??= start;
++
++    return (toRadix(start, rawStart), toRadix(end, rawEnd));
++  }
++
++  static int _parseInt(dynamic digit) => switch (digit) {
++        int() => digit,
++        double() => digit.toInt(),
++        String() => int.tryParse(digit) ?? 0,
++        _ => 0
++      };
++
++  static double _parseDouble(dynamic digit) => switch (digit) {
++        int() => digit.toDouble(),
++        double() => digit,
++        String() => double.tryParse(digit) ?? 0,
++        _ => 0
++      };
++
++  static Tween<T> _makeTween<T>(T start, T end) {
++    return start == end
++        ? ConstantTween<T>(start)
++        : Tween<T>(begin: start, end: end);
++  }
++
++  static double _degreeToRadian(int degree) {
++    const pi180 = pi / 180.0;
++    return degree * pi180;
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/models/danmaku_item.dart b/third_party/canvas_danmaku/lib/models/danmaku_item.dart
+new file mode 100644
+index 0000000..197ca2d
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/models/danmaku_item.dart
+@@ -0,0 +1,81 @@
++import 'dart:ui' as ui;
++
++import 'package:canvas_danmaku/models/danmaku_content_item.dart';
++import 'package:canvas_danmaku/utils/utils.dart';
++
++class DanmakuItem<T> {
++  /// 弹幕内容
++  final DanmakuContentItem<T> content;
++
++  /// 弹幕宽度
++  double width;
++
++  /// 弹幕高度
++  double height;
++
++  /// 弹幕水平方向位置
++  double xPosition;
++
++  /// 上次绘制时间
++  int? drawTick;
++
++  /// 弹幕布局缓存
++  ui.Image? image;
++
++  bool expired = false;
++
++  bool suspend = false;
++
++  @pragma("vm:prefer-inline")
++  bool needRemove(bool needRemove) {
++    if (needRemove) {
++      dispose();
++    }
++    return needRemove;
++  }
++
++  void dispose() {
++    image?.dispose();
++    image = null;
++  }
++
++  DanmakuItem({
++    required this.content,
++    required this.height,
++    required this.width,
++    this.xPosition = 0,
++    this.image,
++    this.drawTick,
++  });
++
++  void drawParagraphIfNeeded(
++    double fontSize,
++    int fontWeight,
++    double strokeWidth,
++  ) {
++    if (image == null) {
++      final paragraph = DmUtils.generateParagraph(
++        content: content,
++        fontSize: fontSize,
++        fontWeight: fontWeight,
++      );
++      image = DmUtils.recordDanmakuImage(
++        contentParagraph: paragraph,
++        content: content,
++        fontSize: fontSize,
++        fontWeight: fontWeight,
++        strokeWidth: strokeWidth,
++      );
++      width = paragraph.maxIntrinsicWidth +
++          strokeWidth +
++          (content.selfSend ? 4.0 : 0.0);
++      height = paragraph.height + strokeWidth;
++      paragraph.dispose();
++    }
++  }
++
++  @override
++  String toString() {
++    return 'DanmakuItem(content=$content, xPos=$xPosition, size=${ui.Size(width, height)}, drawTick=$drawTick)';
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/models/danmaku_option.dart b/third_party/canvas_danmaku/lib/models/danmaku_option.dart
+new file mode 100644
+index 0000000..14adb85
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/models/danmaku_option.dart
+@@ -0,0 +1,114 @@
++import 'package:canvas_danmaku/canvas_danmaku.dart';
++
++class DanmakuOption {
++  /// 默认的字体大小
++  final double fontSize;
++
++  /// 字体粗细
++  final int fontWeight;
++
++  /// 显示区域，0.1-1.0
++  final double area;
++
++  /// 滚动弹幕运行时间，秒
++  final double duration;
++
++  final double durationInMilliseconds;
++
++  /// 静态弹幕运行时间，秒
++  final double staticDuration;
++
++  final double staticDurationInMilliseconds;
++
++  /// 隐藏顶部弹幕
++  final bool hideTop;
++
++  /// 隐藏底部弹幕
++  final bool hideBottom;
++
++  /// 隐藏滚动弹幕
++  final bool hideScroll;
++
++  /// 隐藏高级弹幕
++  final bool hideSpecial;
++
++  /// 弹幕描边
++  final double strokeWidth;
++
++  /// 滚动弹幕速度不随内容长度变化
++  final bool scrollFixedVelocity;
++
++  /// 海量弹幕模式 (弹幕轨道占满时进行叠加)
++  final bool massiveMode;
++
++  /// 静态弹幕无法添加或宽度超出显示区域时作为滚动弹幕添加
++  final bool static2Scroll;
++
++  /// 为字幕预留空间
++  final bool safeArea;
++
++  /// 弹幕行高
++  final double lineHeight;
++
++  bool hideWhat(DanmakuItemType type) => switch (type) {
++        DanmakuItemType.scroll => hideScroll,
++        DanmakuItemType.top => hideTop,
++        DanmakuItemType.bottom => hideBottom,
++        DanmakuItemType.special => hideSpecial,
++      };
++
++  const DanmakuOption({
++    this.fontSize = 16,
++    this.fontWeight = 4,
++    this.area = 1.0,
++    this.duration = 10,
++    this.staticDuration = 5,
++    this.hideBottom = false,
++    this.hideScroll = false,
++    this.hideTop = false,
++    this.hideSpecial = false,
++    this.strokeWidth = 1.5,
++    this.scrollFixedVelocity = false,
++    this.massiveMode = false,
++    this.static2Scroll = false,
++    this.safeArea = true,
++    this.lineHeight = 1.6,
++  })  : durationInMilliseconds = duration * 1000,
++        staticDurationInMilliseconds = staticDuration * 1000;
++
++  DanmakuOption copyWith({
++    double? fontSize,
++    int? fontWeight,
++    double? area,
++    double? duration,
++    double? staticDuration,
++    bool? hideTop,
++    bool? hideBottom,
++    bool? hideScroll,
++    bool? hideSpecial,
++    double? strokeWidth,
++    bool? scrollFixedVelocity,
++    bool? massiveMode,
++    bool? static2Scroll,
++    bool? safeArea,
++    double? lineHeight,
++  }) {
++    return DanmakuOption(
++      area: area ?? this.area,
++      fontSize: fontSize ?? this.fontSize,
++      fontWeight: fontWeight ?? this.fontWeight,
++      duration: duration ?? this.duration,
++      staticDuration: staticDuration ?? this.staticDuration,
++      hideTop: hideTop ?? this.hideTop,
++      hideBottom: hideBottom ?? this.hideBottom,
++      hideScroll: hideScroll ?? this.hideScroll,
++      hideSpecial: hideSpecial ?? this.hideSpecial,
++      strokeWidth: strokeWidth ?? this.strokeWidth,
++      scrollFixedVelocity: scrollFixedVelocity ?? this.scrollFixedVelocity,
++      massiveMode: massiveMode ?? this.massiveMode,
++      static2Scroll: static2Scroll ?? this.static2Scroll,
++      safeArea: safeArea ?? this.safeArea,
++      lineHeight: lineHeight ?? this.lineHeight,
++    );
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/scroll_danmaku_painter.dart b/third_party/canvas_danmaku/lib/scroll_danmaku_painter.dart
+new file mode 100644
+index 0000000..b050b70
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/scroll_danmaku_painter.dart
+@@ -0,0 +1,109 @@
++import 'dart:ui' as ui;
++
++import 'package:canvas_danmaku/base_danmaku_painter.dart';
++import 'package:canvas_danmaku/models/danmaku_item.dart';
++import 'package:material_ui/material_ui.dart';
++
++final class ScrollDanmakuPainter extends BaseDanmakuPainter {
++  final double trackHeight;
++  final List<List<DanmakuItem>> danmakuItems;
++  final double durationInMilliseconds;
++
++  const ScrollDanmakuPainter({
++    required super.length,
++    required this.trackHeight,
++    required this.danmakuItems,
++    required this.durationInMilliseconds,
++    required super.fontSize,
++    required super.fontWeight,
++    required super.strokeWidth,
++    required super.running,
++    required super.tick,
++    super.batchThreshold,
++  });
++
++  @override
++  void paint(ui.Canvas canvas, ui.Size size) {
++    final ui.PictureRecorder? pictureRecorder;
++    final Canvas pictureCanvas;
++
++    if (length > batchThreshold) {
++      pictureRecorder = ui.PictureRecorder();
++      pictureCanvas = Canvas(pictureRecorder);
++    } else {
++      pictureRecorder = null;
++      pictureCanvas = canvas;
++    }
++
++    DanmakuItem? suspend;
++    int suspendIndex = 0;
++    for (int index = 0; index < danmakuItems.length; index++) {
++      for (var i in danmakuItems[index]) {
++        if (i.expired) continue;
++
++        if (i.suspend) {
++          suspend = i;
++          suspendIndex = index;
++          continue;
++        }
++
++        paintDanmaku(pictureCanvas, size, i, index * trackHeight);
++      }
++    }
++
++    if (suspend case final suspend?) {
++      paintDanmaku(pictureCanvas, size, suspend, suspendIndex * trackHeight);
++    }
++
++    if (pictureRecorder != null) {
++      final ui.Picture picture = pictureRecorder.endRecording();
++      canvas.drawPicture(picture);
++      picture.dispose();
++    }
++  }
++
++  void paintDanmaku(
++    ui.Canvas canvas,
++    ui.Size size,
++    DanmakuItem item,
++    double yPos,
++  ) {
++    item.drawParagraphIfNeeded(
++      fontSize,
++      fontWeight,
++      strokeWidth,
++    );
++    if (!item.suspend) {
++      final startPosition = size.width;
++      final endPosition = -item.width;
++
++      if (item.drawTick == null) {
++        item
++          ..drawTick = tick
++          ..xPosition = startPosition;
++      } else {
++        if (durationInMilliseconds.isNegative) {
++          item.xPosition += (tick - item.drawTick!) * durationInMilliseconds;
++        } else {
++          final distance = startPosition - endPosition;
++          item.xPosition +=
++              ((item.drawTick! - tick) / durationInMilliseconds) * distance;
++        }
++      }
++
++      if (item.xPosition < endPosition || item.xPosition > startPosition) {
++        item.expired = true;
++        return;
++      }
++    }
++
++    BaseDanmakuPainter.paintImg(
++      canvas,
++      item,
++      item.xPosition,
++      yPos,
++    );
++
++    item.drawTick = tick;
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/special_danmaku_painter.dart b/third_party/canvas_danmaku/lib/special_danmaku_painter.dart
+new file mode 100644
+index 0000000..b5e5443
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/special_danmaku_painter.dart
+@@ -0,0 +1,125 @@
++import 'dart:math' show min;
++import 'dart:ui' as ui;
++
++import 'package:canvas_danmaku/base_danmaku_painter.dart';
++import 'package:canvas_danmaku/models/danmaku_content_item.dart';
++import 'package:canvas_danmaku/models/danmaku_item.dart';
++import 'package:canvas_danmaku/utils/utils.dart';
++import 'package:material_ui/material_ui.dart';
++
++final class SpecialDanmakuPainter extends BaseDanmakuPainter {
++  List<DanmakuItem> danmakuItems;
++
++  SpecialDanmakuPainter({
++    required super.length,
++    required this.danmakuItems,
++    required super.fontSize,
++    required super.fontWeight,
++    required super.strokeWidth,
++    required super.running,
++    required super.tick,
++    super.batchThreshold,
++  });
++
++  static final _paint = Paint();
++
++  void paintDanmaku(ui.Canvas canvas, ui.Size size, DanmakuItem item) {
++    final elapsed = tick - (item.drawTick ??= tick);
++    final content = item.content as SpecialDanmakuContentItem;
++    if (0 <= elapsed && elapsed < content.duration) {
++      _paintSpecialDanmaku(canvas, item, content, size, elapsed);
++    } else {
++      item.expired = true;
++    }
++  }
++
++  @pragma("vm:prefer-inline")
++  void _paintSpecialDanmaku(Canvas canvas, DanmakuItem dm,
++      SpecialDanmakuContentItem item, Size size, int elapsed) {
++    // 透明度动画
++    final color = item.alphaTween == null
++        ? item.color
++        : item.color.withValues(
++            alpha: item.alphaTween!.transform(
++            elapsed / item.duration,
++          ));
++
++    // 位移动画
++    double dx, dy;
++    if (elapsed > item.translationStartDelay) {
++      late final translateProgress = item.easingType.transform(min(1.0,
++          (elapsed - item.translationStartDelay) / item.translationDuration));
++
++      double getOffset(Tween<double> tween) => tween is ConstantTween
++          ? tween.begin!
++          : tween.transform(translateProgress);
++
++      dx = getOffset(item.translateXTween) * size.width;
++      dy = getOffset(item.translateYTween) * size.height;
++    } else {
++      dx = item.translateXTween.begin! * size.width;
++      dy = item.translateYTween.begin! * size.height;
++    }
++    dx += item.rect.left;
++    dy += item.rect.top;
++
++    paintImg(
++      canvas,
++      dm.image ??= DmUtils.recordSpecialDanmakuImg(
++        content: item,
++        fontWeight: fontWeight,
++        strokeWidth: strokeWidth,
++      ),
++      dx,
++      dy,
++      item.rect.width,
++      item.rect.height,
++      _paint..color = color,
++    );
++  }
++
++  void paintImg(
++    ui.Canvas canvas,
++    ui.Image image,
++    double dx,
++    double dy,
++    double imgW,
++    double imgH,
++    Paint paint,
++  ) {
++    if (image.width == imgW.ceil()) {
++      canvas.drawImage(image, Offset(dx, dy), paint);
++    } else {
++      final src =
++          Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble());
++      final dst = Rect.fromLTWH(dx, dy, imgW, imgH);
++      canvas.drawImageRect(image, src, dst, paint);
++    }
++  }
++
++  @override
++  void paint(Canvas canvas, Size size) {
++    final ui.PictureRecorder? pictureRecorder;
++    final Canvas pictureCanvas;
++    final length = danmakuItems.length;
++
++    if (length > batchThreshold) {
++      pictureRecorder = ui.PictureRecorder();
++      pictureCanvas = Canvas(pictureRecorder);
++    } else {
++      pictureRecorder = null;
++      pictureCanvas = canvas;
++    }
++    for (var i in danmakuItems) {
++      if (i.expired) continue;
++
++      paintDanmaku(pictureCanvas, size, i);
++    }
++
++    if (pictureRecorder != null) {
++      final ui.Picture picture = pictureRecorder.endRecording();
++      canvas.drawPicture(picture);
++      picture.dispose();
++    }
++  }
++}
+diff --git a/third_party/canvas_danmaku/lib/static_danmaku_painter.dart b/third_party/canvas_danmaku/lib/static_danmaku_painter.dart
+new file mode 100644
+index 0000000..8520b24
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/static_danmaku_painter.dart
+@@ -0,0 +1,56 @@
++import 'package:canvas_danmaku/base_danmaku_painter.dart';
++import 'package:canvas_danmaku/models/danmaku_item.dart';
++import 'package:material_ui/material_ui.dart';
++
++final class StaticDanmakuPainter extends CustomPainter {
++  final int count;
++  final double trackHeight;
++  final List<DanmakuItem?> danmakuItems;
++  final double staticDurationInMilliseconds;
++  final double fontSize;
++  final int fontWeight;
++  final double strokeWidth;
++  final int tick;
++
++  StaticDanmakuPainter({
++    required this.count,
++    required this.trackHeight,
++    required this.danmakuItems,
++    required this.staticDurationInMilliseconds,
++    required this.fontSize,
++    required this.fontWeight,
++    required this.strokeWidth,
++    required this.tick,
++  });
++
++  @override
++  void paint(Canvas canvas, Size size) {
++    for (int i = 0; i < danmakuItems.length; i++) {
++      final item = danmakuItems[i];
++      if (item != null) {
++        item
++          ..drawTick ??= tick
++          ..drawParagraphIfNeeded(
++            fontSize,
++            fontWeight,
++            strokeWidth,
++          )
++          ..xPosition = (size.width - item.width) / 2;
++
++        BaseDanmakuPainter.paintImg(
++          canvas,
++          item,
++          item.xPosition,
++          trackHeight * i,
++        );
++      }
++    }
++  }
++
++  @override
++  bool shouldRepaint(covariant StaticDanmakuPainter oldDelegate) =>
++      oldDelegate.count != count ||
++      oldDelegate.fontSize != fontSize ||
++      oldDelegate.fontWeight != fontWeight ||
++      oldDelegate.strokeWidth != strokeWidth;
++}
+diff --git a/third_party/canvas_danmaku/lib/utils/utils.dart b/third_party/canvas_danmaku/lib/utils/utils.dart
+new file mode 100644
+index 0000000..32d43cf
+--- /dev/null
++++ b/third_party/canvas_danmaku/lib/utils/utils.dart
+@@ -0,0 +1,476 @@
++import 'dart:io' show HttpClient;
++import 'dart:math';
++import 'dart:typed_data' show BytesBuilder;
++import 'dart:ui' as ui;
++
++import 'package:canvas_danmaku/models/danmaku_content_item.dart';
++import 'package:material_ui/material_ui.dart';
++
++abstract final class DmUtils {
++  static const maxRasterizeSize = 8192.0;
++
++  /// 表情图片缓存上限（直播弹幕的表情种类有限，够用）
++  static const int maxEmoteCacheSize = 240;
++  static final Map<String, ui.Image> _emoteCache = {};
++
++  static double devicePixelRatio = 1;
++  static final Paint _selfSendPaint = Paint()
++    ..style = PaintingStyle.stroke
++    ..color = Colors.green;
++
++  /// 绘制表情图片用
++  static final Paint _paint = Paint();
++
++  static void updateSelfSendPaint(double strokeWidth) {
++    _selfSendPaint.strokeWidth = strokeWidth;
++  }
++
++  static String? fontFamily;
++
++  // ---------------------------------------------------------------------------
++  // 表情弹幕支持
++  // ---------------------------------------------------------------------------
++
++  /// 已缓存的表情图片
++  static ui.Image? emoteImage(String url) => _emoteCache[url];
++
++  /// 预加载表情图片。直播/弹幕都是先拿 URL 再画，必须提前解码，
++  /// 否则栅格化时拿不到图只能退化画文字。
++  static Future<void> preloadEmotes(
++    Iterable<DanmakuEmote> emotes, {
++    Map<String, String>? headers,
++  }) async {
++    final pending = <String>{};
++    for (final emote in emotes) {
++      if (emote.url.isEmpty || _emoteCache.containsKey(emote.url)) continue;
++      pending.add(emote.url);
++    }
++    for (final url in pending) {
++      if (_emoteCache.containsKey(url)) continue;
++      final image = await _loadEmoteImage(url, headers);
++      if (image == null) continue;
++      if (_emoteCache.length >= maxEmoteCacheSize) {
++        final oldest = _emoteCache.keys.first;
++        _emoteCache.remove(oldest);
++      }
++      _emoteCache[url] = image;
++    }
++  }
++
++  static Future<ui.Image?> _loadEmoteImage(
++    String url,
++    Map<String, String>? headers,
++  ) async {
++    final client = HttpClient();
++    try {
++      final request = await client.getUrl(Uri.parse(url));
++      headers?.forEach((key, value) => request.headers.set(key, value));
++      final response = await request.close();
++      if (response.statusCode != 200) return null;
++      final builder = BytesBuilder(copy: false);
++      await for (final chunk in response) {
++        builder.add(chunk);
++      }
++      final bytes = builder.takeBytes();
++      if (bytes.isEmpty) return null;
++      final codec = await ui.instantiateImageCodec(bytes);
++      final frame = await codec.getNextFrame();
++      codec.dispose();
++      return frame.image;
++    } catch (_) {
++      return null;
++    } finally {
++      client.close();
++    }
++  }
++
++  /// 表情在弹幕里的显示尺寸：按字号归一，避免官方大表情糊满屏幕
++  static ui.Size emoteDisplaySize(DanmakuEmote emote, double fontSize) {
++    final rawWidth = emote.width > 0 ? emote.width : fontSize * 1.4;
++    final rawHeight = emote.height > 0 ? emote.height : fontSize * 1.4;
++    final height = rawHeight
++        .clamp(fontSize * 1.2, fontSize * 2.4)
++        .toDouble();
++    return ui.Size(rawWidth * (height / rawHeight), height);
++  }
++
++  /// 把弹幕文本切成「文字 / 表情」片段
++  static List<({String text, DanmakuEmote? emote})> emoteSegments(
++    DanmakuContentItem content,
++  ) {
++    final text = content.text;
++    final emotes = content.emotes;
++    if (emotes == null || emotes.isEmpty || text.isEmpty) {
++      return [(text: text, emote: null)];
++    }
++    final keys = emotes.keys
++        .where((key) => key.isNotEmpty && text.contains(key))
++        .toList()
++      ..sort((a, b) => b.length.compareTo(a.length));
++    if (keys.isEmpty) return [(text: text, emote: null)];
++
++    final segments = <({String text, DanmakuEmote? emote})>[];
++    var index = 0;
++    while (index < text.length) {
++      var matchStart = -1;
++      String? matchKey;
++      for (final key in keys) {
++        final position = text.indexOf(key, index);
++        if (position != -1 && (matchStart == -1 || position < matchStart)) {
++          matchStart = position;
++          matchKey = key;
++        }
++      }
++      if (matchKey == null) {
++        segments.add((text: text.substring(index), emote: null));
++        break;
++      }
++      if (matchStart > index) {
++        segments.add((text: text.substring(index, matchStart), emote: null));
++      }
++      segments.add((text: matchKey, emote: emotes[matchKey]));
++      index = matchStart + matchKey.length;
++    }
++    return segments;
++  }
++
++  static void _addContentSpans(
++    ui.ParagraphBuilder builder,
++    DanmakuContentItem content,
++    ui.TextStyle style,
++    double fontSize,
++  ) {
++    builder.pushStyle(style);
++    for (final segment in emoteSegments(content)) {
++      final emote = segment.emote;
++      if (emote == null) {
++        if (segment.text.isNotEmpty) builder.addText(segment.text);
++      } else {
++        final size = emoteDisplaySize(emote, fontSize);
++        builder.addPlaceholder(
++          size.width,
++          size.height,
++          ui.PlaceholderAlignment.middle,
++        );
++      }
++    }
++    builder.pop();
++  }
++
++  /// 把表情画进占位区域；图没加载好时退化画占位文字
++  static void _drawEmotes(
++    ui.Canvas canvas,
++    ui.Paragraph paragraph,
++    ui.Offset offset,
++    DanmakuContentItem content,
++  ) {
++    final emotes = content.emotes;
++    if (emotes == null || emotes.isEmpty) return;
++    final segments = emoteSegments(content)
++        .where((segment) => segment.emote != null)
++        .toList();
++    if (segments.isEmpty) return;
++    final boxes = paragraph.getBoxesForPlaceholders();
++    for (var i = 0; i < boxes.length && i < segments.length; i++) {
++      final emote = segments[i].emote!;
++      final box = boxes[i];
++      final dst = ui.Rect.fromLTRB(
++        offset.dx + box.left,
++        offset.dy + box.top,
++        offset.dx + box.right,
++        offset.dy + box.bottom,
++      );
++      final image = _emoteCache[emote.url];
++      if (image != null) {
++        canvas.drawImageRect(
++          image,
++          ui.Rect.fromLTWH(
++            0,
++            0,
++            image.width.toDouble(),
++            image.height.toDouble(),
++          ),
++          dst,
++          _paint,
++        );
++      } else {
++        _drawEmoteFallback(canvas, dst, segments[i].text);
++      }
++    }
++  }
++
++  static void _drawEmoteFallback(ui.Canvas canvas, ui.Rect rect, String text) {
++    if (text.isEmpty || rect.width <= 0 || rect.height <= 0) return;
++    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
++      textAlign: TextAlign.left,
++      textDirection: TextDirection.ltr,
++      fontFamily: fontFamily,
++      maxLines: 1,
++    ))
++      ..pushStyle(ui.TextStyle(
++        color: const ui.Color(0xFFFFFFFF),
++        fontSize: rect.height * 0.55,
++      ))
++      ..addText(text);
++    final paragraph = builder.build()
++      ..layout(ui.ParagraphConstraints(width: rect.width));
++    canvas.drawParagraph(paragraph, ui.Offset(rect.left, rect.top));
++    paragraph.dispose();
++  }
++
++  static ui.Paragraph generateParagraph({
++    required DanmakuContentItem content,
++    required double fontSize,
++    required int fontWeight,
++  }) {
++    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
++      textAlign: TextAlign.left,
++      fontWeight: FontWeight.values[fontWeight],
++      textDirection: TextDirection.ltr,
++      fontFamily: fontFamily,
++      maxLines: 1,
++    ));
++
++    if (content.count case final count?) {
++      builder
++        ..pushStyle(ui.TextStyle(
++          color: content.color,
++          fontSize: fontSize * 0.6,
++        ))
++        ..addText('($count)')
++        ..pop();
++    }
++
++    _addContentSpans(
++      builder,
++      content,
++      ui.TextStyle(color: content.color, fontSize: fontSize),
++      fontSize,
++    );
++
++    return builder.build()
++      ..layout(const ui.ParagraphConstraints(width: double.infinity));
++  }
++
++  static ui.Image recordDanmakuImage({
++    required ui.Paragraph contentParagraph,
++    required DanmakuContentItem content,
++    required double fontSize,
++    required int fontWeight,
++    required double strokeWidth,
++  }) {
++    double w = contentParagraph.maxIntrinsicWidth + strokeWidth;
++    double h = contentParagraph.height + strokeWidth;
++
++    final offset = Offset(
++      (strokeWidth / 2.0) + (content.selfSend ? 2.0 : 0.0),
++      strokeWidth / 2.0,
++    );
++
++    final rec = ui.PictureRecorder();
++    final canvas = ui.Canvas(rec);
++    if (devicePixelRatio != 1) {
++      canvas.scale(devicePixelRatio);
++    }
++
++    if (strokeWidth != 0) {
++      final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
++        textAlign: TextAlign.left,
++        fontWeight: FontWeight.values[fontWeight],
++        textDirection: TextDirection.ltr,
++        fontFamily: fontFamily,
++        maxLines: 1,
++      ));
++      final Paint strokePaint = Paint()
++        ..shader = content.isColorful
++            ? const LinearGradient(
++                    colors: [Color(0xFFF2509E), Color(0xFF308BCD)])
++                .createShader(Rect.fromLTWH(0, 0, w, h))
++            : null
++        ..style = PaintingStyle.stroke
++        ..strokeWidth = strokeWidth;
++
++      if (!content.isColorful) {
++        strokePaint.color = Colors.black;
++      }
++
++      if (content.count case final count?) {
++        builder
++          ..pushStyle(ui.TextStyle(
++            fontSize: fontSize * 0.6,
++            foreground: strokePaint,
++          ))
++          ..addText('($count)')
++          ..pop();
++      }
++
++      _addContentSpans(
++        builder,
++        content,
++        ui.TextStyle(fontSize: fontSize, foreground: strokePaint),
++        fontSize,
++      );
++
++      final strokeParagraph = builder.build()
++        ..layout(const ui.ParagraphConstraints(width: double.infinity));
++
++      canvas.drawParagraph(strokeParagraph, offset);
++      strokeParagraph.dispose();
++    }
++
++    canvas.drawParagraph(contentParagraph, offset);
++    _drawEmotes(canvas, contentParagraph, offset, content);
++
++    if (content.selfSend) {
++      w += 4;
++      canvas.drawRect(Rect.fromLTRB(0, 0, w, h), _selfSendPaint);
++    }
++
++    final pic = rec.endRecording();
++    final img = pic.toImageSync(
++      (w * devicePixelRatio).ceil(),
++      (h * devicePixelRatio).ceil(),
++    );
++    pic.dispose();
++    return img;
++  }
++
++  static ui.Image recordSpecialDanmakuImg({
++    required SpecialDanmakuContentItem content,
++    required int fontWeight,
++    required double strokeWidth,
++  }) {
++    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
++      textAlign: TextAlign.left,
++      fontWeight: FontWeight.values[fontWeight],
++      textDirection: TextDirection.ltr,
++      fontSize: content.fontSize,
++      fontFamily: fontFamily,
++    ))
++      ..pushStyle(ui.TextStyle(
++        color: content.color,
++        fontSize: content.fontSize,
++        shadows: content.hasStroke
++            ? [Shadow(color: Colors.black, blurRadius: strokeWidth)]
++            : null,
++      ))
++      ..addText(content.text);
++
++    final paragraph = builder.build()
++      ..layout(const ui.ParagraphConstraints(width: double.infinity));
++
++    final strokeOffset = strokeWidth / 2;
++    final totalWidth = paragraph.maxIntrinsicWidth + strokeWidth;
++    final totalHeight = paragraph.height + strokeWidth;
++
++    final rec = ui.PictureRecorder();
++    final canvas = ui.Canvas(rec);
++
++    Rect rect;
++
++    if (content.rotateZ != 0 || content.matrix != null) {
++      rect = _calculateRotatedBounds(
++        totalWidth,
++        totalHeight,
++        content.rotateZ,
++        content.matrix,
++      );
++
++      if (devicePixelRatio != 1) {
++        canvas.scale(devicePixelRatio);
++      }
++      canvas.translate(strokeOffset - rect.left, strokeOffset - rect.top);
++
++      if (content.matrix case final matrix?) {
++        canvas.transform(matrix.storage);
++      } else {
++        canvas.rotate(content.rotateZ);
++      }
++      canvas.drawParagraph(paragraph, Offset.zero);
++    } else {
++      rect = Rect.fromLTRB(0, 0, totalWidth, totalHeight);
++
++      if (devicePixelRatio != 1) {
++        canvas.scale(devicePixelRatio);
++      }
++      canvas.drawParagraph(paragraph, Offset(strokeOffset, strokeOffset));
++    }
++    paragraph.dispose();
++
++    double width = rect.width * devicePixelRatio;
++    double height = rect.height * devicePixelRatio;
++    if (width > maxRasterizeSize || height > maxRasterizeSize) {
++      final scaledMaxSize = maxRasterizeSize / devicePixelRatio;
++      final left = rect.left;
++      final top = rect.top;
++      double right = rect.right;
++      double bottom = rect.bottom;
++
++      if (width > maxRasterizeSize) {
++        right = left + scaledMaxSize;
++        width = maxRasterizeSize;
++      }
++
++      if (height > maxRasterizeSize) {
++        bottom = top + scaledMaxSize;
++        height = maxRasterizeSize;
++      }
++
++      rect = Rect.fromLTRB(left, top, right, bottom);
++    }
++
++    content.rect = rect;
++
++    final pic = rec.endRecording();
++    final img = pic.toImageSync(width.ceil(), height.ceil());
++    pic.dispose();
++
++    return img;
++  }
++
++  static Rect _calculateRotatedBounds(
++    double w,
++    double h,
++    double rotateZ,
++    Matrix4? matrix,
++  ) {
++    final double cosZ;
++    final double cosY;
++    final double sinZ;
++    if (matrix == null) {
++      cosZ = cos(rotateZ);
++      sinZ = sin(rotateZ);
++      cosY = 1;
++    } else {
++      cosZ = matrix[5];
++      sinZ = matrix[1];
++      cosY = matrix[10];
++    }
++
++    final wx = w * cosZ * cosY;
++    final wy = w * sinZ;
++    final hx = -h * sinZ * cosY;
++    final hy = h * cosZ;
++
++    final minX = _min4(0.0, wx, hx, wx + hx);
++    final maxX = _max4(0.0, wx, hx, wx + hx);
++    final minY = _min4(0.0, wy, hy, wy + hy);
++    final maxY = _max4(0.0, wy, hy, wy + hy);
++
++    return Rect.fromLTRB(minX, minY, maxX, maxY);
++  }
++
++  @pragma("vm:prefer-inline")
++  static double _min4(double a, double b, double c, double d) {
++    final ab = a < b ? a : b;
++    final cd = c < d ? c : d;
++    return ab < cd ? ab : cd;
++  }
++
++  @pragma("vm:prefer-inline")
++  static double _max4(double a, double b, double c, double d) {
++    final ab = a > b ? a : b;
++    final cd = c > d ? c : d;
++    return ab > cd ? ab : cd;
++  }
++}
+diff --git a/third_party/canvas_danmaku/pubspec.yaml b/third_party/canvas_danmaku/pubspec.yaml
+new file mode 100644
+index 0000000..c94d242
+--- /dev/null
++++ b/third_party/canvas_danmaku/pubspec.yaml
+@@ -0,0 +1,57 @@
++name: canvas_danmaku
++description: "A high performance danmaku lib for flutter."
++version: 0.2.6
++#author: Predidit <i@predidit.com>
++homepage: https://github.com/Predidit/canvas_danmaku
++
++environment:
++  sdk: ">=3.0.0 <4.0.0"
++  flutter: ">=1.17.0"
++
++dependencies:
++  flutter:
++    sdk: flutter
++  cupertino_ui: any
++  material_ui: any
++
++dev_dependencies:
++  flutter_test:
++    sdk: flutter
++  flutter_lints: ^6.0.0
++
++# For information on the generic Dart part of this file, see the
++# following page: https://dart.dev/tools/pub/pubspec
++
++# The following section is specific to Flutter packages.
++flutter:
++
++  # To add assets to your package, add an assets section, like this:
++  # assets:
++  #   - images/a_dot_burr.jpeg
++  #   - images/a_dot_ham.jpeg
++  #
++  # For details regarding assets in packages, see
++  # https://flutter.dev/assets-and-images/#from-packages
++  #
++  # An image asset can refer to one or more resolution-specific "variants", see
++  # https://flutter.dev/assets-and-images/#resolution-aware
++
++  # To add custom fonts to your package, add a fonts section here,
++  # in this "flutter" section. Each entry in this list should have a
++  # "family" key with the font family name, and a "fonts" key with a
++  # list giving the asset and other descriptors for the font. For
++  # example:
++  # fonts:
++  #   - family: Schyler
++  #     fonts:
++  #       - asset: fonts/Schyler-Regular.ttf
++  #       - asset: fonts/Schyler-Italic.ttf
++  #         style: italic
++  #   - family: Trajan Pro
++  #     fonts:
++  #       - asset: fonts/TrajanPro.ttf
++  #       - asset: fonts/TrajanPro_Bold.ttf
++  #         weight: 700
++  #
++  # For details regarding fonts in packages, see
++  # https://flutter.dev/custom-fonts/#from-packages

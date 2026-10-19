@@ -1,0 +1,1410 @@
+diff --git a/lib/models_new/download/bili_download_entry_info.dart b/lib/models_new/download/bili_download_entry_info.dart
+index a44abef..bcb3bee 100644
+--- a/lib/models_new/download/bili_download_entry_info.dart
++++ b/lib/models_new/download/bili_download_entry_info.dart
+@@ -3,8 +3,11 @@ import 'package:PiliPlus/models/common/video/video_quality.dart';
+ import 'package:PiliPlus/models/common/video/video_type.dart';
+ import 'package:PiliPlus/models_new/download/download_info.dart';
+ import 'package:PiliPlus/models_new/sponsor_block/segment_item.dart';
++import 'package:PiliPlus/pages/audio/models/local_audio_item.dart';
++import 'package:PiliPlus/pages/audio/view.dart';
+ import 'package:PiliPlus/pages/common/multi_select/base.dart'
+     show MultiSelectData;
++import 'package:PiliPlus/pages/download/folder/folder_dialogs.dart';
+ import 'package:PiliPlus/utils/page_utils.dart';
+ import 'package:PiliPlus/utils/path_utils.dart';
+ import 'package:PiliPlus/utils/platform_utils.dart';
+@@ -129,6 +132,29 @@ class BiliDownloadEntryInfo with MultiSelectData {
+             );
+           },
+         ),
++        if (isCompleted)
++          PopupMenuItem(
++            height: 38,
++            child: const Text('听音频', style: TextStyle(fontSize: 13)),
++            onTap: () {
++              final items = LocalAudioItem.playlistOf(this);
++              AudioPage.toAudioPage(
++                oid: avid,
++                localItems: items,
++                localIndex: LocalAudioItem.indexOfEntry(items, this),
++              );
++            },
++          ),
++        PopupMenuItem(
++          height: 38,
++          child: const Text('移动到文件夹', style: TextStyle(fontSize: 13)),
++          onTap: () {
++            final context = Get.context;
++            if (context != null) {
++              showMoveToFolderDialog(context, [cid]);
++            }
++          },
++        ),
+         if (PlatformUtils.isDesktop)
+           PopupMenuItem(
+             height: 38,
+diff --git a/lib/models_new/download/download_info.dart b/lib/models_new/download/download_info.dart
+index db8479e..8914b81 100644
+--- a/lib/models_new/download/download_info.dart
++++ b/lib/models_new/download/download_info.dart
+@@ -27,9 +27,13 @@ class DownloadSeasonInfo with MultiSelectData {
+   final String pageId;
+   final List<DownloadPageInfo> pages;
+ 
++  /// 是否是用户在离线缓存里自建的文件夹（逻辑分组，不是 B 站合集）
++  final bool isFolder;
++
+   DownloadSeasonInfo({
+     required this.seasonInfo,
+     required this.pageId,
+     required this.pages,
++    this.isFolder = false,
+   });
+ }
+diff --git a/lib/pages/audio/controller.dart b/lib/pages/audio/controller.dart
+index 213d5b4..95bfb6a 100644
+--- a/lib/pages/audio/controller.dart
++++ b/lib/pages/audio/controller.dart
+@@ -19,6 +19,7 @@ import 'package:PiliPlus/http/constants.dart';
+ import 'package:PiliPlus/http/loading_state.dart';
+ import 'package:PiliPlus/models/common/audio_normalization.dart';
+ import 'package:PiliPlus/models/video/play/url.dart' as http_model show Volume;
++import 'package:PiliPlus/pages/audio/models/local_audio_item.dart';
+ import 'package:PiliPlus/pages/common/common_intro_controller.dart'
+     show FavMixin;
+ import 'package:PiliPlus/pages/dynamics_repost/view.dart';
+@@ -76,6 +77,15 @@ class AudioController extends GetxController
+   Player? player;
+   late int cacheAudioQa;
+ 
++  /// 离线(已下载视频)的播放列表，非空即表示当前处于本地「听视频」模式：
++  /// 不请求 gRPC 的播放列表与播放地址，直接放本地文件。
++  List<LocalAudioItem>? localItems;
++  bool get isLocal => localItems?.isNotEmpty == true;
++  int _localIndex = 0;
++
++  /// 本地列表的「正序」基准（合集内按集数排好），排序功能以它为种子
++  List<LocalAudioItem>? _localSeed;
++
+   late bool isDragging = false;
+   final RxInt position = RxInt(0);
+   final RxInt duration = RxInt(0);
+@@ -158,12 +168,13 @@ class AudioController extends GetxController
+   void onInit() {
+     super.onInit();
+     final args = Get.arguments;
+-    oid = Int64(args['oid']);
++    localItems = args['localItems'] as List<LocalAudioItem>?;
++    oid = Int64(args['oid'] ?? 0);
+     final id = args['id'];
+     this.id = id != null ? Int64(id) : oid;
+     subId = (args['subId'] as List<int>?)?.map(Int64.new).toList() ?? [oid];
+-    itemType = args['itemType'];
+-    from = args['from'];
++    itemType = args['itemType'] ?? 1;
++    from = args['from'] ?? PlaylistSource.UP_ARCHIVE;
+     _start = args['start'];
+     final int? extraId = args['extraId'];
+     if (extraId != null) {
+@@ -175,25 +186,32 @@ class AudioController extends GetxController
+       } catch (_) {}
+     }
+ 
+-    _queryPlayList(isInit: true);
++    if (isLocal) {
++      // 离线模式：播放列表与播放地址都来自本地缓存，不打网络请求
++      cacheAudioQa = Pref.defaultAudioQa;
++    } else {
++      _queryPlayList(isInit: true);
+ 
+-    final String? audioUrl = args['audioUrl'];
+-    final hasAudioUrl = audioUrl != null;
+-    if (hasAudioUrl) {
+-      _querySponsorBlock();
+-      _onOpenMedia(
+-        audioUrl,
+-        ua: BrowserUa.pc,
+-        referer: HttpString.baseUrl,
+-        volume: _videoDetailController?.volume,
+-      );
+-    }
+-    ConnectivityUtils.isWiFi.then((isWiFi) {
+-      cacheAudioQa = isWiFi ? Pref.defaultAudioQa : Pref.defaultAudioQaCellular;
+-      if (!hasAudioUrl) {
+-        _queryPlayUrl();
++      final String? audioUrl = args['audioUrl'];
++      final hasAudioUrl = audioUrl != null;
++      if (hasAudioUrl) {
++        _querySponsorBlock();
++        _onOpenMedia(
++          audioUrl,
++          ua: BrowserUa.pc,
++          referer: HttpString.baseUrl,
++          volume: _videoDetailController?.volume,
++        );
+       }
+-    });
++      ConnectivityUtils.isWiFi.then((isWiFi) {
++        cacheAudioQa = isWiFi
++            ? Pref.defaultAudioQa
++            : Pref.defaultAudioQaCellular;
++        if (!hasAudioUrl) {
++          _queryPlayUrl();
++        }
++      });
++    }
+     videoPlayerServiceHandler
+       ?..onPlay = onPlay
+       ..onPause = onPause
+@@ -211,6 +229,89 @@ class AudioController extends GetxController
+         ..onPause = onPause
+         ..isPlaying = isPlaying;
+     }
++
++    if (isLocal) {
++      _initLocal(args['localIndex'] ?? 0);
++    }
++  }
++
++  /// 离线模式下建播放列表并起播第 [initialIndex] 条
++  void _initLocal(int initialIndex) {
++    final items = localItems!;
++    _localSeed = List<LocalAudioItem>.of(items);
++    playlist = items.map((e) => e.toDetailItem()).toList();
++    final index = initialIndex.clamp(0, items.length - 1);
++    _playLocalIndex(index, force: true);
++  }
++
++  /// 按播放顺序重排本地列表（不打断当前播放）
++  void _reorderLocal(ListOrder value) {
++    final seed = _localSeed;
++    if (seed == null || seed.isEmpty) return;
++    final current = localItems![_localIndex];
++    final items = <LocalAudioItem>[];
++    if (value == ListOrder.ORDER_REVERSE) {
++      items.addAll(seed.reversed);
++    } else if (value == ListOrder.ORDER_RANDOM) {
++      items.addAll(seed);
++      items.shuffle();
++    } else if (value == ListOrder.ORDER_NORMAL) {
++      items.addAll(seed);
++    } else {
++      // 无序：最近下载的排在前面
++      items.addAll(seed);
++      items.sort((a, b) => b.downloadTime.compareTo(a.downloadTime));
++    }
++    localItems = items;
++    playlist = items.map((e) => e.toDetailItem()).toList();
++    final newIndex = items.indexWhere((e) => e.cid == current.cid);
++    _localIndex = newIndex == -1 ? 0 : newIndex;
++    index = _localIndex;
++    audioItem.value = playlist![_localIndex];
++  }
++
++  void _playLocalIndex(int index, {bool force = false}) {
++    final items = localItems;
++    if (items == null || index < 0 || index >= items.length) return;
++    if (!force && index == _localIndex) return;
++    _localIndex = index;
++    this.index = index;
++    final localItem = items[index];
++    oid = Int64(localItem.avid);
++    subId = [Int64(localItem.cid)];
++    final detailItem = localItem.toDetailItem();
++    if (playlist case final list?) {
++      list[index] = detailItem;
++    }
++    _updateCurrItem(detailItem);
++    _onOpenLocalMedia(localItem.path);
++  }
++
++  /// 列表循环回到开头：随机模式下重新洗牌整个列表
++  void _restartLocalCycle() {
++    if (order == ListOrder.ORDER_RANDOM) {
++      final seed = _localSeed;
++      if (seed != null && seed.length > 1) {
++        final items = List<LocalAudioItem>.of(seed);
++        items.shuffle();
++        localItems = items;
++        playlist = items.map((e) => e.toDetailItem()).toList();
++      }
++    }
++    _playLocalIndex(0, force: true);
++  }
++
++  /// 本地文件不需要 UA/Referer，media_kit 直接吃路径
++  Future<void> _onOpenLocalMedia(String path) async {
++    await _initPlayerIfNeeded();
++    player?.open(
++      Media(
++        path,
++        start: _start,
++        extras: audioFilterExtras(null),
++      ),
++    );
++    _start = null;
+   }
+ 
+   bool isPlaying() {
+@@ -701,6 +802,19 @@ class AudioController extends GetxController
+   }
+ 
+   bool playPrev() {
++    if (isLocal) {
++      final prev = _localIndex - 1;
++      if (prev >= 0) {
++        _playLocalIndex(prev);
++        return true;
++      }
++      // 列表循环：从第一首往前是最后一首
++      if (playMode.value == PlayRepeat.listCycle) {
++        _playLocalIndex(localItems!.length - 1);
++        return true;
++      }
++      return false;
++    }
+     if (index != null && playlist != null && player != null) {
+       final prev = index! - 1;
+       if (prev >= 0) {
+@@ -712,6 +826,19 @@ class AudioController extends GetxController
+   }
+ 
+   bool playNext({bool nextPart = false}) {
++    if (isLocal) {
++      final next = _localIndex + 1;
++      if (next < localItems!.length) {
++        _playLocalIndex(next);
++        return true;
++      }
++      // 列表循环：到底了回到第一首，随机模式重新洗牌
++      if (playMode.value == PlayRepeat.listCycle) {
++        _restartLocalCycle();
++        return true;
++      }
++      return false;
++    }
+     if (nextPart) {
+       if (audioItem.value case DetailItem(:final parts)) {
+         if (parts.length > 1) {
+@@ -745,6 +872,11 @@ class AudioController extends GetxController
+   }
+ 
+   void playIndex(int index, {List<Int64>? subId}) {
++    if (isLocal) {
++      if (index == _localIndex && subId == null) return;
++      _playLocalIndex(index);
++      return;
++    }
+     if (index == this.index && subId == null) return;
+     this.index = index;
+     final audioItem = playlist![index];
+@@ -776,7 +908,7 @@ class AudioController extends GetxController
+   }
+ 
+   Future<void> loadPrev(BuildContext context) async {
+-    if (_prev == null) return;
++    if (isLocal || _prev == null) return;
+     final length = playlist!.length;
+     await _queryPlayList(isLoadPrev: true);
+     if (length != playlist!.length && context.mounted) {
+@@ -785,7 +917,7 @@ class AudioController extends GetxController
+   }
+ 
+   Future<void> loadNext(BuildContext context) async {
+-    if (_next == null) return;
++    if (isLocal || _next == null) return;
+     final length = playlist!.length;
+     await _queryPlayList(isLoadNext: true);
+     if (length != playlist!.length && context.mounted) {
+@@ -794,10 +926,15 @@ class AudioController extends GetxController
+   }
+ 
+   void onChangeOrder(ListOrder value) {
+-    if (order != value) {
++    if (order == value) return;
++    if (isLocal) {
++      // 本地列表：在合集内重排，不需要请求服务端
+       order = value;
+-      _queryPlayList(isInit: true);
++      _reorderLocal(value);
++      return;
+     }
++    order = value;
++    _queryPlayList(isInit: true);
+   }
+ 
+   @override
+diff --git a/lib/pages/audio/models/local_audio_item.dart b/lib/pages/audio/models/local_audio_item.dart
+new file mode 100644
+index 0000000..e129163
+--- /dev/null
++++ b/lib/pages/audio/models/local_audio_item.dart
+@@ -0,0 +1,160 @@
++import 'package:PiliPlus/grpc/bilibili/app/listener/v1.pb.dart'
++    show Author, BKArcPart, BKArchive, DetailItem, PlayItem;
++import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
++import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
++import 'package:PiliPlus/services/download/download_folder_store.dart';
++import 'package:PiliPlus/services/download/download_service.dart';
++import 'package:fixnum/fixnum.dart' show Int64;
++import 'package:get/get.dart';
++
++/// 「听视频」的本地(离线)播放源。
++///
++/// 由下载缓存里的 [BiliDownloadEntryInfo] 转换而来：优先播分离出来的音频轨
++/// (m4s)，没有音轨时直接播视频文件(mp4)，两种 media_kit 都能读。
++///
++/// 之所以要单独搞一层，是因为 [AudioPage] 原本完全依赖
++/// `bilibili.app.listener.v1` 的 gRPC 接口拿播放列表和播放地址，
++/// 离线时这两样都没有。
++class LocalAudioItem {
++  /// 实际交给播放器的本地文件路径
++  final String path;
++
++  final String title;
++  final String cover;
++  final String upName;
++  final String upAvatar;
++  final int upMid;
++  final int avid;
++  final int cid;
++  final String bvid;
++
++  /// 毫秒
++  final int durationMs;
++
++  /// 秒，0 表示未知
++  final int publishTime;
++
++  /// 下载时间戳，用于「无序」排序
++  final int downloadTime;
++
++  const LocalAudioItem({
++    required this.path,
++    required this.title,
++    required this.cover,
++    required this.avid,
++    required this.cid,
++    required this.durationMs,
++    this.bvid = '',
++    this.upName = '',
++    this.upAvatar = '',
++    this.upMid = 0,
++    this.publishTime = 0,
++    this.downloadTime = 0,
++  });
++
++  int get durationSeconds => durationMs <= 0 ? 0 : (durationMs / 1000).round();
++
++  factory LocalAudioItem.fromEntry(BiliDownloadEntryInfo entry) {
++    final source = FileSource(
++      dir: entry.entryDirPath,
++      typeTag: entry.typeTag ?? '',
++      isMp4: entry.mediaType == 1,
++      hasDashAudio: entry.hasDashAudio,
++    );
++    return LocalAudioItem(
++      path: source.audioSource ?? source.videoSource,
++      title: entry.showTitle,
++      cover: entry.cover,
++      avid: entry.avid,
++      cid: entry.cid,
++      bvid: entry.bvid,
++      upName: entry.ownerName ?? '',
++      upMid: entry.ownerId ?? 0,
++      durationMs: entry.totalTimeMilli,
++      publishTime: entry.timeCreateStamp,
++      downloadTime: entry.timeCreateStamp,
++    );
++  }
++
++  /// 造一个最小可用的 [DetailItem]，让复用的界面(封面/标题/UP/播放列表)不用改。
++  ///
++  /// 离线模式下点赞/投币/收藏/评论这些联网操作是隐藏的，所以 stat 可以不填。
++  DetailItem toDetailItem() => DetailItem(
++    item: PlayItem(
++      itemType: 1,
++      oid: Int64(avid),
++      subId: [Int64(cid)],
++    ),
++    arc: BKArchive(
++      oid: Int64(avid),
++      title: title,
++      cover: cover,
++      duration: Int64(durationSeconds),
++      publish: Int64(publishTime),
++      displayedOid: bvid,
++    ),
++    owner: Author(
++      mid: Int64(upMid),
++      name: upName,
++      avatar: upAvatar,
++    ),
++    parts: [
++      BKArcPart(
++        oid: Int64(avid),
++        subId: Int64(cid),
++        title: title,
++        duration: Int64(durationSeconds),
++        page: 1,
++      ),
++    ],
++    playable: 1,
++  );
++
++  /// 取 [entry] 所属的「合集 / 分P」里所有下载完成的条目，按集数顺序组成离线
++  /// 播放列表。
++  ///
++  /// 分组规则必须和离线缓存列表一致，否则会出现「只播一首」：
++  /// - 被归入自建文件夹 → 整个文件夹（文件夹等价于「合集」）
++  /// - 同一合集（下载时带了 [BiliDownloadEntryInfo.seasonInfo]）→ 整个合集
++  /// - 普通多P视频（同一 avid）→ 该视频的所有分P
++  static List<LocalAudioItem> playlistOf(BiliDownloadEntryInfo entry) {
++    final entries = <BiliDownloadEntryInfo>[];
++    if (Get.isRegistered<DownloadService>()) {
++      final downloadList = Get.find<DownloadService>().downloadList;
++      final season = entry.seasonInfo;
++      final folderId = DownloadFolderStore.folderOf(entry.cid);
++      entries.addAll(
++        downloadList.where((e) {
++          if (!e.isCompleted) return false;
++          if (folderId != null) {
++            return DownloadFolderStore.folderOf(e.cid) == folderId;
++          }
++          if (season != null) return e.seasonInfo == season;
++          return e.pageId == entry.pageId;
++        }),
++      );
++    }
++    if (!entries.any((e) => e.cid == entry.cid)) {
++      entries.add(entry);
++    }
++    entries.sort(sortByEpisode);
++    return entries.map(LocalAudioItem.fromEntry).toList();
++  }
++
++  /// 集数/分P 升序；同序号时按下载时间兜底，保证顺序稳定
++  static int sortByEpisode(BiliDownloadEntryInfo a, BiliDownloadEntryInfo b) {
++    final ai = a.seasonInfo?.index ?? a.sortKey;
++    final bi = b.seasonInfo?.index ?? b.sortKey;
++    final cmp = ai.compareTo(bi);
++    return cmp != 0 ? cmp : a.timeCreateStamp.compareTo(b.timeCreateStamp);
++  }
++
++  /// 当前条目在 [playlistOf] 结果里的下标
++  static int indexOfEntry(
++    List<LocalAudioItem> items,
++    BiliDownloadEntryInfo entry,
++  ) {
++    final index = items.indexWhere((e) => e.cid == entry.cid);
++    return index == -1 ? 0 : index;
++  }
++}
+diff --git a/lib/pages/audio/view.dart b/lib/pages/audio/view.dart
+index 365ffcd..9052013 100644
+--- a/lib/pages/audio/view.dart
++++ b/lib/pages/audio/view.dart
+@@ -17,6 +17,7 @@ import 'package:PiliPlus/grpc/bilibili/app/listener/v1.pb.dart';
+ import 'package:PiliPlus/models/common/image_preview_type.dart';
+ import 'package:PiliPlus/models/common/image_type.dart';
+ import 'package:PiliPlus/pages/audio/controller.dart';
++import 'package:PiliPlus/pages/audio/models/local_audio_item.dart';
+ import 'package:PiliPlus/pages/audio/volume_button.dart';
+ import 'package:PiliPlus/pages/setting/models/play_settings.dart'
+     show showPlayerVolumeDialog;
+@@ -52,14 +53,16 @@ class AudioPage extends StatefulWidget {
+ 
+   static void toAudioPage({
+     int? id,
+-    required int oid,
++    int oid = 0,
+     List<int>? subId,
+-    required int itemType,
+-    required PlaylistSource from,
++    int itemType = 1,
++    PlaylistSource from = PlaylistSource.UP_ARCHIVE,
+     String? heroTag,
+     Duration? start,
+     String? audioUrl,
+     int? extraId,
++    List<LocalAudioItem>? localItems,
++    int localIndex = 0,
+   }) => Get.toNamed(
+     '/audio',
+     arguments: {
+@@ -72,6 +75,8 @@ class AudioPage extends StatefulWidget {
+       'start': ?start,
+       'audioUrl': ?audioUrl,
+       'extraId': ?extraId,
++      'localItems': ?localItems,
++      if (localItems != null) 'localIndex': localIndex,
+     },
+   );
+ }
+@@ -100,7 +105,9 @@ class _AudioPageState extends State<AudioPage> {
+     return SimpleScaffold(
+       appBar: AppBar(
+         actions: [
+-          if (_controller.isUgc && _controller.enableSponsorBlock)
++          if (_controller.isUgc &&
++              !_controller.isLocal &&
++              _controller.enableSponsorBlock)
+             Obx(() {
+               if (_controller.segmentProgressList.isNotEmpty) {
+                 return IconButton(
+@@ -138,7 +145,7 @@ class _AudioPageState extends State<AudioPage> {
+               ),
+             icon: const Icon(Icons.schedule, size: 22),
+           ),
+-          if (_controller.isUgc)
++          if (_controller.isUgc && !_controller.isLocal)
+             IconButton(
+               tooltip: '更多',
+               onPressed: _showMore,
+@@ -175,13 +182,14 @@ class _AudioPageState extends State<AudioPage> {
+                       mainAxisAlignment: MainAxisAlignment.center,
+                       crossAxisAlignment: CrossAxisAlignment.start,
+                       children: [
+-                        Obx(() {
+-                          final audioItem = _controller.audioItem.value;
+-                          if (audioItem != null) {
+-                            return _buildActions(audioItem);
+-                          }
+-                          return const SizedBox.shrink();
+-                        }),
++                        if (!_controller.isLocal)
++                          Obx(() {
++                            final audioItem = _controller.audioItem.value;
++                            if (audioItem != null) {
++                              return _buildActions(audioItem);
++                            }
++                            return const SizedBox.shrink();
++                          }),
+                         const SizedBox(height: 25),
+                         _buildProgressBar(colorScheme),
+                         _buildDuration(colorScheme),
+@@ -966,38 +974,59 @@ class _AudioPageState extends State<AudioPage> {
+                       ),
+                       const SizedBox(height: 10),
+                     ],
+-                    Row(
+-                      children: [
+-                        Icon(
+-                          size: 14,
+-                          Icons.headphones_outlined,
+-                          color: colorScheme.outline,
+-                        ),
+-                        Text.rich(
+-                          TextSpan(
+-                            children: [
+-                              TextSpan(
+-                                text:
+-                                    ' ${NumUtils.numFormat(audioItem.stat.view)}   '
+-                                    '${DateFormatUtils.dateFormat(audioItem.arc.publish.toInt(), long: DateFormatUtils.longFormatD)}   ',
+-                              ),
+-                              TextSpan(
+-                                text: audioItem.arc.displayedOid,
+-                                style: TextStyle(color: colorScheme.secondary),
+-                                recognizer: NoDeadlineTapGestureRecognizer()
+-                                  ..onTap = () => Utils.copyText(
+-                                    audioItem.arc.displayedOid,
+-                                  ),
+-                              ),
+-                            ],
++                    if (_controller.isLocal)
++                      Row(
++                        mainAxisSize: MainAxisSize.min,
++                        children: [
++                          Icon(
++                            size: 14,
++                            Icons.download_done,
++                            color: colorScheme.outline,
++                          ),
++                          Text(
++                            ' 本地缓存 · 离线播放',
++                            style: TextStyle(
++                              fontSize: 13,
++                              color: colorScheme.outline,
++                            ),
+                           ),
+-                          style: TextStyle(
+-                            fontSize: 13,
++                        ],
++                      )
++                    else
++                      Row(
++                        children: [
++                          Icon(
++                            size: 14,
++                            Icons.headphones_outlined,
+                             color: colorScheme.outline,
+                           ),
+-                        ),
+-                      ],
+-                    ),
++                          Text.rich(
++                            TextSpan(
++                              children: [
++                                TextSpan(
++                                  text:
++                                      ' ${NumUtils.numFormat(audioItem.stat.view)}   '
++                                      '${DateFormatUtils.dateFormat(audioItem.arc.publish.toInt(), long: DateFormatUtils.longFormatD)}   ',
++                                ),
++                                TextSpan(
++                                  text: audioItem.arc.displayedOid,
++                                  style: TextStyle(
++                                    color: colorScheme.secondary,
++                                  ),
++                                  recognizer: NoDeadlineTapGestureRecognizer()
++                                    ..onTap = () => Utils.copyText(
++                                      audioItem.arc.displayedOid,
++                                    ),
++                                ),
++                              ],
++                            ),
++                            style: TextStyle(
++                              fontSize: 13,
++                              color: colorScheme.outline,
++                            ),
++                          ),
++                        ],
++                      ),
+                     if (audioItem.arc.hasDesc()) ...[
+                       const SizedBox(height: 10),
+                       SelectionText(audioItem.arc.desc),
+@@ -1006,7 +1035,7 @@ class _AudioPageState extends State<AudioPage> {
+                 ),
+               ),
+             ),
+-            if (isPortrait) ...[
++            if (isPortrait && !_controller.isLocal) ...[
+               const SizedBox(height: 10),
+               _buildActions(audioItem),
+             ],
+diff --git a/lib/pages/download/download/controller.dart b/lib/pages/download/download/controller.dart
+index e5c21b8..124da14 100644
+--- a/lib/pages/download/download/controller.dart
++++ b/lib/pages/download/download/controller.dart
+@@ -1,9 +1,11 @@
+ import 'dart:async';
+ 
+ import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
++import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
+ import 'package:PiliPlus/models_new/download/download_info.dart';
+ import 'package:PiliPlus/pages/common/multi_select/base.dart'
+     show BaseMultiSelectMixin;
++import 'package:PiliPlus/services/download/download_folder_store.dart';
+ import 'package:PiliPlus/services/download/download_service.dart';
+ import 'package:PiliPlus/utils/storage.dart';
+ import 'package:collection/collection.dart';
+@@ -78,10 +80,59 @@ class DownloadController extends GetxController
+         );
+       }
+     }
++    _applyFolders(list);
+     seasons.value = list;
+     flag.value++;
+   }
+ 
++  /// 把自建文件夹里的条目从原分组摘出来，作为一个「文件夹」分组插到最前面
++  void _applyFolders(List<DownloadSeasonInfo> list) {
++    final folders = DownloadFolderStore.folders;
++    if (folders.isEmpty) return;
++    final folderIds = {for (final folder in folders) folder.id};
++    final buckets = <int, List<BiliDownloadEntryInfo>>{};
++
++    for (final season in list) {
++      for (final page in season.pages) {
++        page.entries.removeWhere((entry) {
++          final folderId = DownloadFolderStore.folderOf(entry.cid);
++          if (folderId == null || !folderIds.contains(folderId)) return false;
++          buckets
++              .putIfAbsent(folderId, () => <BiliDownloadEntryInfo>[])
++              .add(entry);
++          return true;
++        });
++      }
++      season.pages.removeWhere((page) => page.entries.isEmpty);
++    }
++    list.removeWhere((season) => season.pages.isEmpty);
++
++    final folderSeasons = <DownloadSeasonInfo>[];
++    for (final folder in folders) {
++      final entries = buckets[folder.id];
++      if (entries == null || entries.isEmpty) continue;
++      entries.sort((a, b) => a.sortKey.compareTo(b.sortKey));
++      folderSeasons.add(
++        DownloadSeasonInfo(
++          seasonInfo: SeasonInfo(
++            index: 0,
++            id: folder.id,
++            title: folder.name,
++            cover: entries.first.cover,
++            mid: 0,
++            uname: '本地文件夹',
++          ),
++          pageId: 'folder-${folder.id}',
++          isFolder: true,
++          pages: entries.map((e) => e.toDownloadPageInfo(e.pageId)).toList(),
++        ),
++      );
++    }
++    if (folderSeasons.isNotEmpty) {
++      list.insertAll(0, folderSeasons);
++    }
++  }
++
+   @override
+   void onRemove() {
+     showConfirmDialog(
+diff --git a/lib/pages/download/download/view.dart b/lib/pages/download/download/view.dart
+index 92d4394..6f1a560 100644
+--- a/lib/pages/download/download/view.dart
++++ b/lib/pages/download/download/view.dart
+@@ -12,6 +12,7 @@ import 'package:PiliPlus/pages/download/download/controller.dart';
+ import 'package:PiliPlus/pages/download/download/widgets/page.dart';
+ import 'package:PiliPlus/pages/download/download/widgets/season.dart';
+ import 'package:PiliPlus/pages/download/download_action_mixin.dart';
++import 'package:PiliPlus/pages/download/folder/folder_dialogs.dart';
+ import 'package:PiliPlus/pages/download/search/view.dart';
+ import 'package:PiliPlus/services/download/download_service.dart';
+ import 'package:PiliPlus/utils/extension/iterable_ext.dart';
+@@ -140,10 +141,25 @@ class _DownloadPageState extends State<DownloadPage>
+         child: SimpleScaffold(
+           appBar: MultiSelectAppBarWidget(
+             ctr: _controller,
+-            actions: [updateBtn()],
++            actions: [updateBtn(), moveToFolderBtn()],
+             child: AppBar(
+               title: const Text('离线缓存'),
+               actions: [
++                PopupMenuButton<int>(
++                  tooltip: '文件夹',
++                  icon: const Icon(Icons.folder_outlined),
++                  itemBuilder: (context) => const [
++                    PopupMenuItem(height: 40, value: 0, child: Text('新建文件夹')),
++                    PopupMenuItem(height: 40, value: 1, child: Text('管理文件夹')),
++                  ],
++                  onSelected: (value) {
++                    if (value == 0) {
++                      showCreateFolderDialog(context);
++                    } else {
++                      showFolderManagerDialog(context);
++                    }
++                  },
++                ),
+                 IconButton(
+                   tooltip: '搜索',
+                   onPressed: () async {
+@@ -230,12 +246,14 @@ class _DownloadPageState extends State<DownloadPage>
+                             final seasonInfo = season.seasonInfo;
+                             final pages = season.pages;
+ 
+-                            if (seasonInfo != null && pages.length > 1) {
++                            if (seasonInfo != null &&
++                                (pages.length > 1 || season.isFolder)) {
+                               return SeasonInfoItem(
+                                 controller: _controller,
+                                 downloadService: downloadService,
+                                 seasonInfo: seasonInfo,
+                                 season: season,
++                                isFolder: season.isFolder,
+                                 enableMultiSelect: enableMultiSelect,
+                                 progress: _progress,
+                                 updateSeasonDm: _updateSeasonDm,
+diff --git a/lib/pages/download/download/widgets/season.dart b/lib/pages/download/download/widgets/season.dart
+index 8de1823..a664ac8 100644
+--- a/lib/pages/download/download/widgets/season.dart
++++ b/lib/pages/download/download/widgets/season.dart
+@@ -25,6 +25,7 @@ class SeasonInfoItem extends StatelessWidget {
+     required this.enableMultiSelect,
+     required this.progress,
+     required this.updateSeasonDm,
++    this.isFolder = false,
+   });
+ 
+   final BaseMultiSelectMixin<DownloadSeasonInfo> controller;
+@@ -35,6 +36,9 @@ class SeasonInfoItem extends StatelessWidget {
+   final ChangeNotifier progress;
+   final ValueChanged<DownloadSeasonInfo> updateSeasonDm;
+ 
++  /// 自建文件夹（不是 B 站合集）
++  final bool isFolder;
++
+   @override
+   Widget build(BuildContext context) {
+     final colorScheme = ColorScheme.of(context);
+@@ -116,7 +120,7 @@ class SeasonInfoItem extends StatelessWidget {
+                       ),
+                     ),
+                   ),
+-                  const PBadge(text: '合集', top: 6.0, right: 6.0),
++                  PBadge(text: isFolder ? '文件夹' : '合集', top: 6.0, right: 6.0),
+                   PBadge(
+                     text:
+                         '${season.pages.fold(0, (a, b) => a + b.entries.length)}个视频',
+diff --git a/lib/pages/download/download_action_mixin.dart b/lib/pages/download/download_action_mixin.dart
+index be3efc6..8eff0b7 100644
+--- a/lib/pages/download/download_action_mixin.dart
++++ b/lib/pages/download/download_action_mixin.dart
+@@ -1,6 +1,7 @@
+ import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
+ import 'package:PiliPlus/models_new/download/download_info.dart';
+ import 'package:PiliPlus/pages/common/multi_select/base.dart';
++import 'package:PiliPlus/pages/download/folder/folder_dialogs.dart';
+ import 'package:PiliPlus/services/download/download_service.dart';
+ import 'package:PiliPlus/utils/extension/iterable_ext.dart';
+ import 'package:PiliPlus/utils/page_utils.dart';
+@@ -137,4 +138,28 @@ mixin BaseDownloadActionMixin<
+       ),
+     );
+   }
++
++  /// 多选时把选中项挪进自建文件夹
++  Widget moveToFolderBtn() {
++    return Builder(
++      builder: (context) => TextButton(
++        style: TextButton.styleFrom(visualDensity: .compact),
++        onPressed: () {
++          final cids = <int>[];
++          for (final item in multiSelectCtr.allChecked) {
++            if (item is DownloadSeasonInfo) {
++              for (final page in item.pages) {
++                cids.addAll(page.entries.map((e) => e.cid));
++              }
++            } else if (item is DownloadPageInfo) {
++              cids.addAll(item.entries.map((e) => e.cid));
++            }
++          }
++          if (cids.isEmpty) return;
++          showMoveToFolderDialog(context, cids);
++        },
++        child: Text('文件夹', style: TextStyle(color: colorScheme.onSurface)),
++      ),
++    );
++  }
+ }
+diff --git a/lib/pages/download/folder/folder_dialogs.dart b/lib/pages/download/folder/folder_dialogs.dart
+new file mode 100644
+index 0000000..e86166a
+--- /dev/null
++++ b/lib/pages/download/folder/folder_dialogs.dart
+@@ -0,0 +1,251 @@
++import 'package:PiliPlus/common/widgets/dialog/dialog.dart';
++import 'package:PiliPlus/common/widgets/dialog/simple_dialog_option.dart';
++import 'package:PiliPlus/services/download/download_folder_store.dart';
++import 'package:PiliPlus/services/download/download_service.dart';
++import 'package:get/get.dart';
++import 'package:material_ui/material_ui.dart';
++
++/// 文件夹改动后让离线缓存列表重新分组
++void _refreshDownloadList() {
++  if (Get.isRegistered<DownloadService>()) {
++    Get.find<DownloadService>().flagNotifier.refresh();
++  }
++}
++
++/// 新建文件夹，返回新文件夹 id（取消返回 null）
++Future<int?> showCreateFolderDialog(BuildContext context) async {
++  final textController = TextEditingController();
++  final name = await showDialog<String>(
++    context: context,
++    builder: (context) => AlertDialog(
++      title: const Text('新建文件夹'),
++      content: TextField(
++        controller: textController,
++        autofocus: true,
++        maxLength: 30,
++        decoration: const InputDecoration(
++          hintText: '文件夹名称',
++          counterText: '',
++        ),
++        onSubmitted: (value) => Navigator.of(context).pop(value),
++      ),
++      actions: [
++        TextButton(
++          onPressed: () => Navigator.of(context).pop(),
++          child: const Text('取消'),
++        ),
++        TextButton(
++          onPressed: () => Navigator.of(context).pop(textController.text),
++          child: const Text('确定'),
++        ),
++      ],
++    ),
++  );
++  final trimmed = name?.trim() ?? '';
++  if (trimmed.isEmpty) return null;
++  final id = await DownloadFolderStore.create(trimmed);
++  _refreshDownloadList();
++  return id;
++}
++
++/// 把条目移动到文件夹 / 移出文件夹
++Future<void> showMoveToFolderDialog(
++  BuildContext context,
++  List<int> cids,
++) async {
++  if (cids.isEmpty) return;
++  final folders = DownloadFolderStore.folders;
++  final current = DownloadFolderStore.folderOf(cids.first);
++  final hasFolder = cids.any((cid) => DownloadFolderStore.folderOf(cid) != null);
++
++  await showDialog<void>(
++    context: context,
++    builder: (context) => SimpleDialog(
++      clipBehavior: Clip.hardEdge,
++      contentPadding: const EdgeInsets.symmetric(vertical: 12),
++      children: [
++        Padding(
++          padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
++          child: Text(
++            '移动到文件夹 (${cids.length})',
++            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
++          ),
++        ),
++        for (final folder in folders)
++          DialogOption(
++            onPressed: () async {
++              Navigator.of(context).pop();
++              await DownloadFolderStore.moveTo(cids, folder.id);
++              _refreshDownloadList();
++            },
++            child: Row(
++              children: [
++                Icon(
++                  folder.id == current
++                      ? Icons.folder
++                      : Icons.folder_outlined,
++                  size: 20,
++                ),
++                const SizedBox(width: 10),
++                Expanded(
++                  child: Text(
++                    folder.name,
++                    style: const TextStyle(fontSize: 14),
++                    overflow: TextOverflow.ellipsis,
++                  ),
++                ),
++                if (folder.id == current)
++                  const Icon(Icons.check, size: 18),
++              ],
++            ),
++          ),
++        DialogOption(
++          onPressed: () async {
++            Navigator.of(context).pop();
++            final folderId = await showCreateFolderDialog(context);
++            if (folderId != null) {
++              await DownloadFolderStore.moveTo(cids, folderId);
++              _refreshDownloadList();
++            }
++          },
++          child: const Row(
++            children: [
++              Icon(Icons.create_new_folder_outlined, size: 20),
++              SizedBox(width: 10),
++              Text('新建文件夹…', style: TextStyle(fontSize: 14)),
++            ],
++          ),
++        ),
++        if (hasFolder)
++          DialogOption(
++            onPressed: () async {
++              Navigator.of(context).pop();
++              await DownloadFolderStore.moveTo(cids, null);
++              _refreshDownloadList();
++            },
++            child: const Row(
++              children: [
++                Icon(Icons.folder_off_outlined, size: 20),
++                SizedBox(width: 10),
++                Text('移出文件夹', style: TextStyle(fontSize: 14)),
++              ],
++            ),
++          ),
++      ],
++    ),
++  );
++}
++
++/// 管理已建的文件夹：重命名 / 删除
++Future<void> showFolderManagerDialog(BuildContext context) async {
++  final folders = DownloadFolderStore.folders;
++  await showDialog<void>(
++    context: context,
++    builder: (context) => SimpleDialog(
++      clipBehavior: Clip.hardEdge,
++      contentPadding: const EdgeInsets.symmetric(vertical: 12),
++      children: [
++        const Padding(
++          padding: EdgeInsets.fromLTRB(16, 4, 16, 10),
++          child: Text(
++            '管理文件夹',
++            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
++          ),
++        ),
++        if (folders.isEmpty)
++          const Padding(
++            padding: EdgeInsets.fromLTRB(16, 4, 16, 10),
++            child: Text(
++              '还没有文件夹，先新建一个',
++              style: TextStyle(fontSize: 13),
++            ),
++          ),
++        for (final folder in folders)
++          DialogOption(
++            child: Row(
++              children: [
++                const Icon(Icons.folder_outlined, size: 20),
++                const SizedBox(width: 10),
++                Expanded(
++                  child: Text(
++                    '${folder.name}'
++                    '（${DownloadFolderStore.cidsOf(folder.id).length}）',
++                    style: const TextStyle(fontSize: 14),
++                    overflow: TextOverflow.ellipsis,
++                  ),
++                ),
++                IconButton(
++                  tooltip: '重命名',
++                  visualDensity: VisualDensity.compact,
++                  icon: const Icon(Icons.edit_outlined, size: 18),
++                  onPressed: () async {
++                    Navigator.of(context).pop();
++                    await _renameFolder(context, folder.id, folder.name);
++                  },
++                ),
++                IconButton(
++                  tooltip: '删除文件夹',
++                  visualDensity: VisualDensity.compact,
++                  icon: const Icon(Icons.delete_outline, size: 18),
++                  onPressed: () async {
++                    Navigator.of(context).pop();
++                    await _deleteFolder(context, folder.id, folder.name);
++                  },
++                ),
++              ],
++            ),
++          ),
++      ],
++    ),
++  );
++}
++
++Future<void> _renameFolder(
++  BuildContext context,
++  int id,
++  String oldName,
++) async {
++  final textController = TextEditingController(text: oldName);
++  final name = await showDialog<String>(
++    context: context,
++    builder: (context) => AlertDialog(
++      title: const Text('重命名文件夹'),
++      content: TextField(
++        controller: textController,
++        autofocus: true,
++        maxLength: 30,
++        decoration: const InputDecoration(counterText: ''),
++        onSubmitted: (value) => Navigator.of(context).pop(value),
++      ),
++      actions: [
++        TextButton(
++          onPressed: () => Navigator.of(context).pop(),
++          child: const Text('取消'),
++        ),
++        TextButton(
++          onPressed: () => Navigator.of(context).pop(textController.text),
++          child: const Text('确定'),
++        ),
++      ],
++    ),
++  );
++  final trimmed = name?.trim() ?? '';
++  if (trimmed.isEmpty) return;
++  await DownloadFolderStore.rename(id, trimmed);
++  _refreshDownloadList();
++}
++
++Future<void> _deleteFolder(
++  BuildContext context,
++  int id,
++  String name,
++) async {
++  await showConfirmDialog(
++    context: context,
++    title: Text('删除文件夹「$name」？视频不会被删除'),
++    onConfirm: () async {
++      await DownloadFolderStore.remove(id);
++      _refreshDownloadList();
++    },
++  );
++}
+diff --git a/lib/pages/download/page/view.dart b/lib/pages/download/page/view.dart
+index 255c21c..58b381f 100644
+--- a/lib/pages/download/page/view.dart
++++ b/lib/pages/download/page/view.dart
+@@ -151,7 +151,7 @@ class _DownloadPagePageState extends State<DownloadPagePage>
+         child: SimpleScaffold(
+           appBar: MultiSelectAppBarWidget(
+             ctr: this,
+-            actions: [updateBtn()],
++            actions: [updateBtn(), moveToFolderBtn()],
+             child: AppBar(
+               title: Text(widget.seasonInfo.title),
+               actions: [
+diff --git a/lib/pages/video/controller.dart b/lib/pages/video/controller.dart
+index 0842e11..c85e5b5 100644
+--- a/lib/pages/video/controller.dart
++++ b/lib/pages/video/controller.dart
+@@ -34,6 +34,7 @@ import 'package:PiliPlus/models_new/video/video_detail/episode.dart' as ugc;
+ import 'package:PiliPlus/models_new/video/video_pbp/data.dart';
+ import 'package:PiliPlus/models_new/video/video_play_info/subtitle.dart';
+ import 'package:PiliPlus/models_new/video/video_stein_edgeinfo/data.dart';
++import 'package:PiliPlus/pages/audio/models/local_audio_item.dart';
+ import 'package:PiliPlus/pages/audio/view.dart';
+ import 'package:PiliPlus/pages/common/publish/publish_route.dart';
+ import 'package:PiliPlus/pages/search/widgets/search_text.dart';
+@@ -1411,6 +1412,18 @@ class VideoDetailController extends GetxController
+   }
+ 
+   void toAudioPage() {
++    if (isFileSource) {
++      // 已下载/离线视频：gRPC 的播放列表与播放地址都不可用，
++      // 用本地缓存文件组一个离线播放列表
++      final items = LocalAudioItem.playlistOf(entry);
++      AudioPage.toAudioPage(
++        oid: aid,
++        heroTag: heroTag,
++        localItems: items,
++        localIndex: LocalAudioItem.indexOfEntry(items, entry),
++      );
++      return;
++    }
+     int? id;
+     int? extraId;
+     PlaylistSource from = PlaylistSource.UP_ARCHIVE;
+diff --git a/lib/pages/video/introduction/local/controller.dart b/lib/pages/video/introduction/local/controller.dart
+index 6133fa1..498aff4 100644
+--- a/lib/pages/video/introduction/local/controller.dart
++++ b/lib/pages/video/introduction/local/controller.dart
+@@ -3,6 +3,7 @@ import 'package:PiliPlus/models_new/video/video_detail/stat_detail.dart';
+ import 'package:PiliPlus/pages/common/common_intro_controller.dart';
+ import 'package:PiliPlus/pages/download/download/controller.dart';
+ import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
++import 'package:PiliPlus/services/download/download_folder_store.dart';
+ import 'package:PiliPlus/services/service_locator.dart';
+ import 'package:PiliPlus/utils/platform_utils.dart';
+ import 'package:extended_nested_scroll_view/extended_nested_scroll_view.dart';
+@@ -51,22 +52,37 @@ class LocalIntroController extends CommonIntroController {
+     super.onInit();
+     videoDetail.value.title = videoDetailCtr.args['title'];
+     final controller = Get.find<DownloadController>();
+-    final list = <BiliDownloadEntryInfo>[];
++    final all = <BiliDownloadEntryInfo>[];
+     for (final seaon in controller.seasons) {
+       for (final page in seaon.pages) {
+         final items = page.entries..sort(downloadEntrySort);
+         final completed = items.where((e) => e.isCompleted);
+-        list.addAllIf(completed.isNotEmpty, completed);
++        all.addAllIf(completed.isNotEmpty, completed);
+         if (completed.length == 1) {
+           aidSet.add(page.pageId);
+         }
+       }
+     }
+-    this.list.value = list;
+     final currCid = videoDetailCtr.cid.value;
++    // 自建文件夹等价于「合集」：播放/连播都限定在同一个文件夹里
++    var list = all;
++    final folderId = DownloadFolderStore.folderOf(currCid);
++    if (folderId != null) {
++      final scoped = all
++          .where((e) => DownloadFolderStore.folderOf(e.cid) == folderId)
++          .toList();
++      if (scoped.any((e) => e.cid == currCid)) list = scoped;
++    } else {
++      // 不在文件夹里的条目，播放列表里排除已归入文件夹的视频，避免串台
++      final rest = all
++          .where((e) => DownloadFolderStore.folderOf(e.cid) == null)
++          .toList();
++      if (rest.any((e) => e.cid == currCid)) list = rest;
++    }
++    this.list.value = list;
+     final index = list.indexWhere((e) => e.cid == currCid);
+     this.index.value = index;
+-    if (PlatformUtils.isMobile) {
++    if (PlatformUtils.isMobile && index != -1) {
+       onVideoDetailChange(list[index]);
+     }
+     if (index != 0) {
+diff --git a/lib/pages/video/view.dart b/lib/pages/video/view.dart
+index f0680dc..1fcc397 100644
+--- a/lib/pages/video/view.dart
++++ b/lib/pages/video/view.dart
+@@ -1188,7 +1188,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
+               ImageUtils.downloadImg([videoDetailController.cover.value]),
+           child: const Text('保存封面'),
+         ),
+-      if (!videoDetailController.isFileSource && videoDetailController.isUgc)
++      if (videoDetailController.isUgc || videoDetailController.isFileSource)
+         PopupMenuItem(
+           onTap: videoDetailController.toAudioPage,
+           child: const Text('听音频'),
+diff --git a/lib/pages/video/widgets/header_control.dart b/lib/pages/video/widgets/header_control.dart
+index a9bae79..3130a49 100644
+--- a/lib/pages/video/widgets/header_control.dart
++++ b/lib/pages/video/widgets/header_control.dart
+@@ -1799,6 +1799,21 @@ class HeaderControlState extends State<HeaderControl>
+                       ),
+                     );
+                   }),
++                if (isFileSource && !isFSOrPip)
++                  SizedBox(
++                    width: btnWidth,
++                    height: btnHeight,
++                    child: IconButton(
++                      tooltip: '听音频',
++                      style: btnStyle,
++                      onPressed: videoDetailCtr.toAudioPage,
++                      icon: const Icon(
++                        Icons.headphones_outlined,
++                        size: 19,
++                        color: Colors.white,
++                      ),
++                    ),
++                  ),
+                 if (!isFileSource) ...[
+                   if (!isFSOrPip) ...[
+                     if (videoDetailCtr.isUgc)
+diff --git a/lib/services/download/download_folder_store.dart b/lib/services/download/download_folder_store.dart
+new file mode 100644
+index 0000000..3dbc12d
+--- /dev/null
++++ b/lib/services/download/download_folder_store.dart
+@@ -0,0 +1,123 @@
++import 'package:PiliPlus/utils/storage.dart';
++import 'package:flutter/foundation.dart';
++import 'package:hive_ce/hive.dart';
++
++/// 离线缓存里的「自建文件夹」。
++///
++/// 只做逻辑分组，不动磁盘上的缓存目录（挪文件会让下载记录失效）。
++/// 数据放在 localCache 这个 box 里，用最普通的 Map/List 存，避免加 Hive adapter。
++class DownloadFolder {
++  final int id;
++  final String name;
++
++  const DownloadFolder({required this.id, required this.name});
++
++  Map<String, dynamic> toJson() => {'id': id, 'name': name};
++
++  factory DownloadFolder.fromJson(Map<dynamic, dynamic> json) => DownloadFolder(
++    id: json['id'] as int,
++    name: json['name'] as String? ?? '未命名文件夹',
++  );
++}
++
++abstract final class DownloadFolderStore {
++  /// 文件夹列表：`[{id, name}]`
++  static const String _kFolders = 'downloadFolders';
++
++  /// 条目归属：`{cid: folderId}`
++  static const String _kItems = 'downloadFolderItems';
++
++  static Box get _box => GStorage.localCache;
++
++  /// 文件夹列表（按创建顺序）
++  static List<DownloadFolder> get folders {
++    final raw = _box.get(_kFolders);
++    if (raw is! List) return const [];
++    final list = <DownloadFolder>[];
++    for (final item in raw) {
++      if (item is Map) {
++        try {
++          list.add(DownloadFolder.fromJson(item));
++        } catch (_) {}
++      }
++    }
++    return list;
++  }
++
++  static DownloadFolder? folderById(int id) {
++    for (final folder in folders) {
++      if (folder.id == id) return folder;
++    }
++    return null;
++  }
++
++  /// cid -> folderId
++  static Map<int, int> get assignments {
++    final raw = _box.get(_kItems);
++    final map = <int, int>{};
++    if (raw is! Map) return map;
++    raw.forEach((key, value) {
++      final cid = switch (key) {
++        int() => key,
++        String() => int.tryParse(key),
++        _ => null,
++      };
++      if (cid != null && value is int) map[cid] = value;
++    });
++    return map;
++  }
++
++  static int? folderOf(int cid) => assignments[cid];
++
++  /// 某个文件夹里的 cid 集合
++  static Set<int> cidsOf(int folderId) => assignments.entries
++      .where((e) => e.value == folderId)
++      .map((e) => e.key)
++      .toSet();
++
++  static Future<int> create(String name) async {
++    final id = DateTime.now().millisecondsSinceEpoch;
++    final list = folders.toList()
++      ..add(DownloadFolder(id: id, name: name.trim()));
++    await _box.put(_kFolders, list.map((e) => e.toJson()).toList());
++    return id;
++  }
++
++  static Future<void> rename(int id, String name) async {
++    final list = folders
++        .map(
++          (e) => e.id == id
++              ? DownloadFolder(id: id, name: name.trim())
++              : e,
++        )
++        .toList();
++    await _box.put(_kFolders, list.map((e) => e.toJson()).toList());
++  }
++
++  /// 删文件夹不删视频，里面的条目会回到原来的分组
++  static Future<void> remove(int id) async {
++    final list = folders.where((e) => e.id != id).toList();
++    await _box.put(_kFolders, list.map((e) => e.toJson()).toList());
++    final map = assignments..removeWhere((_, value) => value == id);
++    await _box.put(_kItems, map);
++  }
++
++  /// [folderId] 为 null 表示移出文件夹
++  static Future<void> moveTo(Iterable<int> cids, int? folderId) async {
++    final map = assignments;
++    for (final cid in cids) {
++      if (folderId == null) {
++        map.remove(cid);
++      } else {
++        map[cid] = folderId;
++      }
++    }
++    await _box.put(_kItems, map);
++  }
++
++  @visibleForTesting
++  static Future<void> clearAll() async {
++    await _box.delete(_kFolders);
++    await _box.delete(_kItems);
++  }
++}
